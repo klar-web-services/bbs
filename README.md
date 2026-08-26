@@ -20,7 +20,7 @@ The scripts install to a user-local directory and verify release checksums. Set 
 
 ## Authenticate
 
-Create an Atlassian API token scoped to Bitbucket with:
+Create an Atlassian API token [here](https://id.atlassian.com/manage-profile/security/api-tokens), scoped to Bitbucket with:
 
 - `read:workspace:bitbucket`
 - `read:repository:bitbucket`
