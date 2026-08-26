@@ -1,0 +1,185 @@
+use crate::{app::SearchRequest, query::CaseMode, search::SortMode};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Parser)]
+#[command(name = "bbs", version, about = "Fast local code search for Bitbucket Cloud", long_about = None)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    /// Boolean query expressions. Multiple expressions are ORed.
+    #[arg(value_name = "QUERY")]
+    pub queries: Vec<String>,
+
+    /// Treat every query as a raw PCRE2 regular expression.
+    #[arg(short = 'r', long)]
+    pub regex: bool,
+
+    /// Repositories as unique slugs, workspace/slug names, or UUIDs.
+    #[arg(long, num_args = 1.., value_delimiter = ',')]
+    pub repos: Vec<String>,
+
+    /// Git-style path glob. May be repeated.
+    #[arg(long = "path")]
+    pub paths: Vec<String>,
+
+    /// Search this branch instead of each repository's default branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Search cached snapshots without contacting Bitbucket.
+    #[arg(long)]
+    pub offline: bool,
+
+    #[arg(short = 'i', long, conflicts_with = "case_sensitive")]
+    pub ignore_case: bool,
+
+    #[arg(short = 's', long, conflicts_with = "ignore_case")]
+    pub case_sensitive: bool,
+
+    #[arg(short = 'C', long)]
+    pub context: Option<usize>,
+
+    #[arg(long)]
+    pub max_results: Option<usize>,
+
+    #[arg(long, value_enum, default_value = "relevance")]
+    pub sort: CliSort,
+
+    #[arg(long, value_enum, default_value = "terminal")]
+    pub format: OutputFormat,
+
+    #[arg(long, value_enum, default_value = "auto")]
+    pub color: ColorChoice,
+
+    #[arg(long)]
+    pub no_cache: bool,
+}
+
+impl Cli {
+    pub fn search_request(&self) -> SearchRequest {
+        SearchRequest {
+            queries: self.queries.clone(),
+            repositories: self.repos.clone(),
+            paths: self.paths.clone(),
+            branch: self.branch.clone(),
+            regex: self.regex,
+            case_mode: if self.ignore_case {
+                CaseMode::Ignore
+            } else if self.case_sensitive {
+                CaseMode::Sensitive
+            } else {
+                CaseMode::Smart
+            },
+            offline: self.offline,
+            context: self.context,
+            max_results: self.max_results,
+            sort: self.sort.into(),
+            no_cache: self.no_cache,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Save and validate a scoped Bitbucket API token.
+    Login(LoginArgs),
+    /// Remove the saved Bitbucket credential.
+    Logout,
+    /// List repositories visible to the authenticated account.
+    Repos(ReposArgs),
+    /// Start the local browser interface.
+    Serve(ServeArgs),
+    /// Inspect or prune local filesystem caches.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// Read the token from standard input instead of prompting.
+    #[arg(long)]
+    pub token_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ReposArgs {
+    #[arg(long)]
+    pub offline: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    #[arg(long)]
+    pub port: Option<u16>,
+    #[arg(long)]
+    pub no_open: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CacheCommand {
+    Status,
+    Prune,
+    ClearResults,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliSort {
+    Relevance,
+    Repo,
+    Path,
+}
+impl From<CliSort> for SortMode {
+    fn from(value: CliSort) -> Self {
+        match value {
+            CliSort::Relevance => Self::Relevance,
+            CliSort::Repo => Self::Repo,
+            CliSort::Path => Self::Path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum OutputFormat {
+    Terminal,
+    Json,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn accepts_multiple_scopes_and_queries() {
+        let cli = Cli::try_parse_from([
+            "bbs",
+            "foo AND bar",
+            "baz",
+            "--repos",
+            "one",
+            "two",
+            "--path",
+            "src/**/*.rs",
+            "--branch",
+            "release/2",
+        ])
+        .unwrap();
+        let request = cli.search_request();
+        assert_eq!(request.queries.len(), 2);
+        assert_eq!(request.repositories.len(), 2);
+        assert_eq!(request.paths, ["src/**/*.rs"]);
+        assert_eq!(request.branch.as_deref(), Some("release/2"));
+    }
+}

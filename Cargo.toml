@@ -1,0 +1,58 @@
+[package]
+name = "better-bitbucket-search"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, ergonomic local code search for Bitbucket Cloud"
+license = "MIT"
+repository = "https://github.com/klar-web-services/better-bitbucket-search"
+default-run = "bbs"
+
+[[bin]]
+name = "bbs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["json", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+directories = "6.0"
+fs2 = "0.4"
+futures = "0.3"
+git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
+globset = "0.4"
+hex = "0.4"
+indicatif = "0.18"
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service"] }
+pcre2 = "0.2"
+rayon = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7.4"
+rust-embed = "8.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
+tempfile = "3.20"
+tokio = { version = "1.47", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
+toml = "0.9"
+tower-http = { version = "0.6", features = ["catch-panic", "compression-gzip", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
+urlencoding = "2.1"
+walkdir = "2.5"
+webbrowser = "1.0"
+zstd = "0.13"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,11 @@
+/.env
+/target/
+/web/node_modules/
+/web/dist/*
+!/web/dist/.gitkeep
+/web/*.tsbuildinfo
+/web/test-results/
+/web/playwright-report/
+*.swp
+*.tmp
+.DS_Store
