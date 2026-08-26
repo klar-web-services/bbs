@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Fast, ergonomic local code search for Bitbucket Cloud"
 license = "MIT"
-repository = "https://github.com/klar-web-services/better-bitbucket-search"
+repository = "https://github.com/klar-web-services/bbs"
 default-run = "bbs"
 
 [[bin]]

@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$Repository = if ($env:BBS_REPOSITORY) { $env:BBS_REPOSITORY } else { 'klar-web-services/better-bitbucket-search' }
+$Repository = if ($env:BBS_REPOSITORY) { $env:BBS_REPOSITORY } else { 'klar-web-services/bbs' }
 $InstallDir = if ($env:BBS_INSTALL_DIR) { $env:BBS_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\bbs' }
 $Version = $env:BBS_VERSION
 if (-not $Version) {

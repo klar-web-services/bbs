@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-BBS_REPOSITORY=${BBS_REPOSITORY:-klar-web-services/better-bitbucket-search}
+BBS_REPOSITORY=${BBS_REPOSITORY:-klar-web-services/bbs}
 BBS_INSTALL_DIR=${BBS_INSTALL_DIR:-"$HOME/.local/bin"}
 BBS_VERSION=${BBS_VERSION:-}
 
