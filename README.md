@@ -18,6 +18,18 @@ irm https://tools.klar.ws/bbs/install.ps1 | iex
 
 The scripts install to a user-local directory and verify release checksums. Set `BBS_REPOSITORY`, `BBS_VERSION`, or `BBS_INSTALL_DIR` to override their defaults. Direct archives and checksum manifests are also available from GitHub Releases.
 
+## Update
+
+```sh
+bbs update
+```
+
+This downloads the latest release for your platform, verifies its SHA-256 against the published `checksums.txt`, and replaces the running binary in place. Nothing is written until the checksum matches.
+
+`bbs update --check` reports whether a newer release exists without installing it, exiting `0` when already current and `1` when an update is available, so it composes in a shell prompt or a cron job.
+
+If the binary lives somewhere you cannot write, the command names that path and stops. It never escalates privileges and never installs a second copy elsewhere on your `PATH`.
+
 ## Authenticate
 
 Create an Atlassian API token [here](https://id.atlassian.com/manage-profile/security/api-tokens), scoped to Bitbucket with:

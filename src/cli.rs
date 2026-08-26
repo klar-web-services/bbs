@@ -90,6 +90,8 @@ pub enum Command {
     Repos(ReposArgs),
     /// Start the local browser interface.
     Serve(ServeArgs),
+    /// Update bbs to the latest published release.
+    Update(UpdateArgs),
     /// Inspect or prune local filesystem caches.
     Cache {
         #[command(subcommand)]
@@ -110,6 +112,13 @@ pub struct ReposArgs {
     pub offline: bool,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Report whether an update is available without installing it.
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -161,6 +170,14 @@ pub enum ColorChoice {
 mod tests {
     use super::*;
     use clap::Parser;
+    #[test]
+    fn parses_the_update_command() {
+        let plain = Cli::try_parse_from(["bbs", "update"]).unwrap();
+        assert!(matches!(plain.command, Some(Command::Update(ref a)) if !a.check));
+        let checking = Cli::try_parse_from(["bbs", "update", "--check"]).unwrap();
+        assert!(matches!(checking.command, Some(Command::Update(ref a)) if a.check));
+    }
+
     #[test]
     fn accepts_multiple_scopes_and_queries() {
         let cli = Cli::try_parse_from([

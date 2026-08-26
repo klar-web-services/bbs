@@ -10,3 +10,4 @@ pub mod output;
 pub mod query;
 pub mod search;
 pub mod server;
+pub mod update;

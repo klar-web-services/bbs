@@ -56,3 +56,10 @@ predicates = "3.1"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[target."cfg(unix)".dependencies]
+flate2 = "1.1.9"
+tar = "0.4.46"
+
+[target."cfg(windows)".dependencies]
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

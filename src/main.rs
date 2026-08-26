@@ -5,7 +5,7 @@ use better_bitbucket_search::{
     cli::{CacheCommand, Cli, Command},
     config::Config,
     model::SearchEvent,
-    output, server,
+    output, server, update,
 };
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -84,6 +84,7 @@ async fn run() -> Result<u8> {
             server::serve(app, args.port.unwrap_or(config.default_port), !args.no_open).await?;
             Ok(0)
         }
+        Some(Command::Update(args)) => update_command(args.check).await,
         Some(Command::Cache { command }) => {
             match command {
                 CacheCommand::Status => {
@@ -133,6 +134,28 @@ async fn run() -> Result<u8> {
             Ok(if response.results.is_empty() { 1 } else { 0 })
         }
     }
+}
+
+async fn update_command(check_only: bool) -> Result<u8> {
+    let http = update::client()?;
+    let repository = update::repository();
+    let current = update::Version::current()?;
+    let latest = update::latest_version(&http, update::API_BASE, &repository).await?;
+    if latest <= current {
+        println!("bbs {current} is already the latest release.");
+        return Ok(0);
+    }
+    if check_only {
+        println!("bbs {current} (latest {latest})");
+        return Ok(1);
+    }
+    let target = std::env::current_exe().context("cannot locate the running bbs binary")?;
+    eprintln!("Updating bbs {current} -> {latest}");
+    let archive = update::download(&http, update::DOWNLOAD_BASE, &repository, latest).await?;
+    let binary = update::extract(&archive)?;
+    update::replace(&target, &binary)?;
+    println!("Updated bbs to {latest} at {}", target.display());
+    Ok(0)
 }
 
 fn search_spinner() -> ProgressBar {
