@@ -257,7 +257,9 @@ mod tests {
         let updated = synchronize(&config, &repository, "main", "unused").unwrap();
         assert_eq!(updated.commit, second.to_string());
         assert_eq!(
-            fs::read_to_string(updated.checkout.join("source.rs")).unwrap(),
+            fs::read_to_string(updated.checkout.join("source.rs"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "fn second() {}\n"
         );
         let offline = load_offline(&config, &repository, "main").unwrap();
