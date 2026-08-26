@@ -3,7 +3,7 @@
   border: 1px solid #2a3445;
   border-radius: 7px;
   color: #dce4f0;
-  font: 12px ui-monospace, monospace;
+  font: 12px var(--mono);
   padding: 7px 28px 7px 10px;
 }
 

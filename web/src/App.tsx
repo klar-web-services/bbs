@@ -1,6 +1,9 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { Fragment, FormEvent, useEffect, useMemo, useState } from 'react'
 import HighlightedLine from './HighlightedLine'
 import type { Bootstrap, Catalog, SearchEvent, SearchResponse, SearchResult } from './types'
+
+const APPLE = typeof navigator !== 'undefined' && /Mac|iPhone|iPod|iPad/i.test(navigator.userAgent)
+const SHORTCUT = APPLE ? '\u2318 K' : 'Ctrl K'
 
 const emptyResponse: SearchResponse = { query: [], results: [], repositories_searched: 0, files_searched: 0, elapsed_ms: 0, cached: false, truncated: false }
 
@@ -76,7 +79,7 @@ export default function App() {
     <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true"><SearchMark /></span><h1>Better Bitbucket Search</h1></div><div className="version">local · v{bootstrap?.version || '…'}</div></header>
     <main>
       <form onSubmit={submit} className="search-panel">
-        <div className="query-row"><span className="prompt">›</span><input id="query" autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder={'foo AND (bar OR /baz\\d+/)'} aria-label="Search query"/><kbd>⌘ K</kbd><button type={running ? 'button' : 'submit'} onClick={running ? cancel : undefined} disabled={!running && !query.trim()}>{running ? 'Cancel' : 'Search'}</button></div>
+        <div className="query-row"><span className="prompt">›</span><input id="query" autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder={'foo AND (bar OR /baz\\d+/)'} aria-label="Search query"/><kbd>{SHORTCUT}</kbd><button type={running ? 'button' : 'submit'} onClick={running ? cancel : undefined} disabled={!running && !query.trim()}>{running ? 'Cancel' : 'Search'}</button></div>
         <div className="filters">
           <label className="filter-field filter-path">Path<input type="text" value={path} onChange={e => setPath(e.target.value)} placeholder="src/**/*.ts" /></label>
           <label className="filter-field filter-branch">Branch<input type="text" value={branch} onChange={e => setBranch(e.target.value)} placeholder="default" /></label>
@@ -107,5 +110,19 @@ function SearchMark() {
 function mergeResult(results: SearchResult[], result: SearchResult) { return [...results.filter(item => !(item.repository === result.repository && item.path === result.path)), result] }
 
 function ResultCard({ result }: { result: SearchResult }) {
-  return <article className="result-card"><div className="result-head"><div><span className="repo">{result.repository}</span><span className="slash">/</span><a href={result.web_url} target="_blank" rel="noreferrer">{result.path}</a></div><div><span>{result.match_count} {result.match_count === 1 ? 'match' : 'matches'}</span><code>{result.branch}@{result.commit.slice(0, 9)}</code>{result.stale && <span className="badge warning">stale</span>}</div></div><div className="code-block">{result.lines.map((line, index) => <div className={`code-line ${line.ranges.length ? 'matched' : ''}`} key={line.number}>{index > 0 && line.number > result.lines[index - 1].number + 1 && <span className="break">···</span>}<span className="line-number">{line.number}</span><HighlightedLine line={line} path={result.path}/></div>)}</div></article>
+  const [collapsed, setCollapsed] = useState(false)
+  return <article className={`result-card ${collapsed ? 'collapsed' : ''}`}>
+    <div className="result-head">
+      <button type="button" className="collapse" onClick={() => setCollapsed(value => !value)} aria-expanded={!collapsed} title={collapsed ? 'Expand result' : 'Collapse result'} aria-label={collapsed ? 'Expand result' : 'Collapse result'}>{collapsed ? '▶' : '▼'}</button>
+      <div><span className="repo">{result.repository}</span><span className="slash">/</span><a href={result.web_url} target="_blank" rel="noreferrer">{result.path}</a></div>
+      <div><span>{result.match_count} {result.match_count === 1 ? 'match' : 'matches'}</span><code>{result.branch}@{result.commit.slice(0, 9)}</code>{result.stale && <span className="badge warning">stale</span>}</div>
+    </div>
+    {!collapsed && <div className="code-block">{result.lines.map((line, index) => {
+      const gap = index > 0 && line.number > result.lines[index - 1].number + 1
+      return <Fragment key={line.number}>
+        {gap && <div className="code-gap" aria-hidden="true"><span className="code-gap-mark">···</span></div>}
+        <div className={`code-line ${line.ranges.length ? 'matched' : ''}`}><span className="line-number">{line.number}</span><HighlightedLine line={line} path={result.path}/></div>
+      </Fragment>
+    })}</div>}
+  </article>
 }

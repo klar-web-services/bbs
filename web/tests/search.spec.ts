@@ -59,3 +59,77 @@ test('keeps the header and filters inside a narrow viewport', async ({ page }) =
   expect(overflow).toEqual([])
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390)
 })
+
+const catalog = {
+  discovered_at: '2026-08-27T00:00:00Z', workspaces: [], repositories: [
+    { uuid: '{repo}', workspace: 'team', slug: 'api', name: 'API', full_name: 'team/api', default_branch: 'main', web_url: 'https://bitbucket.org/team/api' },
+  ],
+}
+
+const gappedResult = {
+  repository: 'team/api', repository_name: 'API', path: 'src/service.rs', branch: 'main', commit: '89fb65ab2c1d',
+  web_url: 'https://bitbucket.org/team/api/src/89fb65a/src/service.rs#lines-111', score: 42, match_count: 2, stale: false,
+  lines: [
+    { number: 110, text: 'fn first() {}', ranges: [], is_context: true },
+    { number: 111, text: 'let wanted = 1;', ranges: [{ start: 4, end: 10, atom: 0 }], is_context: false },
+    { number: 253, text: 'let wanted = 2;', ranges: [{ start: 4, end: 10, atom: 0 }], is_context: false },
+    { number: 254, text: 'fn last() {}', ranges: [], is_context: true },
+  ],
+}
+
+async function renderGappedResult(page: import('@playwright/test').Page) {
+  await page.route('**/api/v1/bootstrap', route => route.fulfill({ json: { csrf_token: 'test-csrf', version: '0.2.0', authenticated: true } }))
+  await page.route('**/api/v1/repositories', route => route.fulfill({ json: catalog }))
+  await page.route('**/api/v1/search', route => route.fulfill({ json: { id: '22222222-2222-4222-8222-222222222222' } }))
+  const response = { query: ['wanted'], results: [gappedResult], repositories_searched: 1, files_searched: 3, elapsed_ms: 5, cached: false, truncated: false }
+  await page.route('**/api/v1/search/*/events', route => route.fulfill({
+    status: 200, contentType: 'text/event-stream',
+    body: `data: ${JSON.stringify({ type: 'done', response })}\n\n`,
+  }))
+  await page.goto('/')
+  await page.getByLabel('Search query').fill('wanted')
+  await page.getByRole('button', { name: 'Search' }).click()
+  await expect(page.getByRole('article')).toBeVisible()
+}
+
+test('marks a line jump as its own row instead of overlapping the gutter', async ({ page }) => {
+  await renderGappedResult(page)
+  const gap = page.locator('.code-gap')
+  await expect(gap).toHaveCount(1)
+
+  // the marker must sit in the gutter, not float over the line numbers
+  const [gapBox, numberBox] = await Promise.all([
+    gap.locator('.code-gap-mark').boundingBox(),
+    page.locator('.code-line', { hasText: 'let wanted = 2;' }).locator('.line-number').boundingBox(),
+  ])
+  const gapBottom = gapBox!.y + gapBox!.height
+  expect(gapBottom).toBeLessThanOrEqual(numberBox!.y + 1)
+
+  // and 111 must not sit directly on top of 253
+  const rows = await page.locator('.code-line, .code-gap').evaluateAll(els => els.map(e => e.className))
+  expect(rows).toEqual(['code-line ', 'code-line matched', 'code-gap', 'code-line matched', 'code-line '])
+})
+
+test('collapses and expands a result', async ({ page }) => {
+  await renderGappedResult(page)
+  const card = page.getByRole('article')
+  await expect(card.locator('.code-block')).toBeVisible()
+
+  await card.getByRole('button', { name: 'Collapse result' }).click()
+  await expect(card.locator('.code-block')).toHaveCount(0)
+
+  await card.getByRole('button', { name: 'Expand result' }).click()
+  await expect(card.locator('.code-block')).toBeVisible()
+})
+
+test('shows the platform shortcut and a monospaced grammar row', async ({ page }) => {
+  await page.route('**/api/v1/bootstrap', route => route.fulfill({ json: { csrf_token: 'test', version: '0.2.0', authenticated: false } }))
+  await page.route('**/api/v1/repositories?offline=true', route => route.fulfill({ json: { discovered_at: '2026-08-27T00:00:00Z', workspaces: [], repositories: [] } }))
+  await page.goto('/')
+
+  // the CI runner and this dev box are both linux, so the label must not say command
+  await expect(page.locator('kbd')).toHaveText('Ctrl K')
+
+  const family = await page.locator('.grammar').evaluate(el => getComputedStyle(el).fontFamily)
+  expect(family).toContain('monospace')
+})
