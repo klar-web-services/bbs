@@ -31,7 +31,7 @@ trap 'rm -r "$bbs_tmp"' EXIT INT TERM
 
 curl -fsSL "$bbs_base/$bbs_asset" -o "$bbs_tmp/$bbs_asset"
 curl -fsSL "$bbs_base/checksums.txt" -o "$bbs_tmp/checksums.txt"
-bbs_expected=$(sed -n "s/[[:space:]]\+$bbs_asset$//p" "$bbs_tmp/checksums.txt" | head -n 1)
+bbs_expected=$(sed -n "s/[[:space:]][[:space:]]*$bbs_asset$//p" "$bbs_tmp/checksums.txt" | head -n 1)
 [ -n "$bbs_expected" ] || { echo "release checksum is missing for $bbs_asset" >&2; exit 1; }
 if command -v sha256sum >/dev/null 2>&1; then bbs_actual=$(sha256sum "$bbs_tmp/$bbs_asset" | awk '{print $1}');
 elif command -v shasum >/dev/null 2>&1; then bbs_actual=$(shasum -a 256 "$bbs_tmp/$bbs_asset" | awk '{print $1}');

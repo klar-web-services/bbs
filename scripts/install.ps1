@@ -7,7 +7,6 @@ if (-not $Version) {
 }
 $Arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
   'X64' { 'x86_64' }
-  'Arm64' { 'aarch64' }
   default { throw "Unsupported architecture: $_" }
 }
 $Asset = "bbs-$Arch-pc-windows-msvc.zip"
