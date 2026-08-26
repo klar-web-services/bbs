@@ -409,6 +409,9 @@ mod tests {
         assert_eq!(leftovers, 1, "no temporary or backup files may remain");
     }
 
+    // Windows ignores the read-only attribute on directories, so only unix can
+    // create this condition without going through ACLs.
+    #[cfg(unix)]
     #[test]
     fn replace_reports_the_directory_it_cannot_write() {
         let dir = tempdir().unwrap();
@@ -429,6 +432,20 @@ mod tests {
 
         assert!(
             error.contains(&readonly.display().to_string()),
+            "the error must name the directory: {error}"
+        );
+    }
+
+    #[test]
+    fn replace_reports_a_directory_that_does_not_exist() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let target = missing.join(BINARY);
+
+        let error = replace(&target, b"new binary").unwrap_err().to_string();
+
+        assert!(
+            error.contains(&missing.display().to_string()),
             "the error must name the directory: {error}"
         );
     }
