@@ -1,4 +1,5 @@
 /.env
+/deploy/
 /target/
 /web/node_modules/
 /web/dist/*

@@ -2,20 +2,18 @@
 
 `bbs` is a fast, local-first code search experience for Bitbucket Cloud. It discovers every repository your scoped API token can read, keeps depth-1 snapshots fresh, and searches them with Boolean expressions, wildcards, PCRE2 regular expressions, path globs, relevance ranking, and syntax-highlighted context. Search from your terminal, or run `bbs serve` for a local browser UI with the same engine behind it.
 
-Bitbucket Cloud's REST code-search endpoint is deprecated for removal on November 1, 2026. `bbs` deliberately uses supported REST APIs only for workspace/repository discovery and performs search against managed local Git snapshots.
-
 ## Install
 
 Release binaries contain the CLI, Git implementation, search engine, and browser UI. Node, Rust, and system Git are not required.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/klar-web-services/better-bitbucket-search/main/scripts/install.sh | sh
+curl -fsSL https://tools.klar.ws/bbs/install.sh | sh
 ```
 
 PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/klar-web-services/better-bitbucket-search/main/scripts/install.ps1 | iex
+irm https://tools.klar.ws/bbs/install.ps1 | iex
 ```
 
 The scripts install to a user-local directory and verify release checksums. Set `BBS_REPOSITORY`, `BBS_VERSION`, or `BBS_INSTALL_DIR` to override their defaults. Direct archives and checksum manifests are also available from GitHub Releases.
