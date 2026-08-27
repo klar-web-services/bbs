@@ -1,5 +1,7 @@
 # Better Bitbucket Search
 
+![The bbs browser interface running the query checksum AND /sha-?256/ AND (verify OR sha256sum OR Get-FileHash), with matches highlighted across a shell script and a Markdown file, two results collapsed](.github/assets/screenshot.png)
+
 `bbs` is a fast, local-first code search experience for Bitbucket Cloud. It discovers every repository your scoped API token can read, keeps depth-1 snapshots fresh, and searches them with Boolean expressions, wildcards, PCRE2 regular expressions, path globs, relevance ranking, and syntax-highlighted context. Search from your terminal, or run `bbs serve` for a local browser UI with the same engine behind it.
 
 ## Install
