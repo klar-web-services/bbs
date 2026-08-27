@@ -18,6 +18,7 @@ export default function App() {
   const [path, setPath] = useState('')
   const [branch, setBranch] = useState('')
   const [regex, setRegex] = useState(false)
+  const [multiline, setMultiline] = useState(false)
   const [offline, setOffline] = useState(false)
   const [caseMode, setCaseMode] = useState<'Smart' | 'Ignore' | 'Sensitive'>('Smart')
   const [sort, setSort] = useState<'relevance' | 'repo' | 'path'>('relevance')
@@ -51,7 +52,7 @@ export default function App() {
     setRunning(true); setError(''); setResponse(emptyResponse); setStatus('Starting search…')
     const request = {
       queries: [query], repositories: selectedRepos, paths: path ? [path] : [], branch: branch || null,
-      regex, case_mode: caseMode, offline, context: 2, max_results: 500, sort, no_cache: false,
+      regex, multiline, case_mode: caseMode, offline, context: 2, max_results: 500, sort, no_cache: false,
     }
     try {
       const created = await fetch('/api/v1/search', { method: 'POST', headers: { 'content-type': 'application/json', 'x-bbs-csrf': bootstrap.csrf_token }, body: JSON.stringify(request) })
@@ -88,7 +89,7 @@ export default function App() {
           <label className="filter-field filter-branch">Branch<input type="text" value={branch} onChange={e => setBranch(e.target.value)} placeholder="default" /></label>
           <label className="filter-field filter-case">Case<select value={caseMode} onChange={e => setCaseMode(e.target.value as typeof caseMode)}><option value="Smart">smart</option><option value="Ignore">ignore</option><option value="Sensitive">sensitive</option></select></label>
           <label className="filter-field filter-sort">Sort<select value={sort} onChange={e => setSort(e.target.value as typeof sort)}><option value="relevance">relevance</option><option value="repo">repository</option><option value="path">path</option></select></label>
-          <label className="check"><input type="checkbox" checked={regex} onChange={e => setRegex(e.target.checked)} /> Raw regex</label>
+          <label className="check"><input type="checkbox" checked={regex} onChange={e => setRegex(e.target.checked)} /> Raw regex</label><label className="check" title="Let wildcards and . span line breaks"><input type="checkbox" checked={multiline} onChange={e => setMultiline(e.target.checked)} /> Multi-line</label>
           <label className="check"><input type="checkbox" checked={offline} onChange={e => setOffline(e.target.checked)} /> Offline</label>
         </div>
         <details className="repo-picker"><summary>{selectedRepos.length ? `${selectedRepos.length} repositories selected` : 'All accessible repositories'}</summary><div className="repo-menu"><input value={repoFilter} onChange={e => setRepoFilter(e.target.value)} placeholder="Filter repositories…"/><button type="button" onClick={() => setSelectedRepos([])}>All repositories</button>{visibleRepos.map(repo => <label key={repo.uuid}><input type="checkbox" checked={selectedRepos.includes(repo.full_name)} onChange={e => setSelectedRepos(current => e.target.checked ? [...current, repo.full_name] : current.filter(item => item !== repo.full_name))}/><span>{repo.full_name}</span><small>{repo.default_branch || 'empty'}</small></label>)}</div></details>

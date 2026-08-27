@@ -86,9 +86,14 @@ Query rules:
 - Multiple positional query expressions are ORed and deduplicated.
 - Bare and quoted terms are literal, with `*` and `?` wildcards constrained to one line.
 - `/.../` is a PCRE2 atom inside a Boolean expression; `-r` treats each complete query as raw PCRE2.
+- `/.../` accepts trailing `i`, `s`, `m`, and `x` flags, so `/foo.*bar/s` spans lines.
+- Terms and `*` wildcards stay on one line. `--multiline` lets them cross line breaks, matching lazily so a wildcard stops at the nearest hit rather than the last one in the file.
+- To find two things in one file without caring where they sit, prefer `foo AND bar`: Boolean expressions are evaluated per file, so the terms may be lines apart.
 - Matching is smart-case by default; use `-i` or `-s` to override it.
 - `--path` accepts Git-style `*`, `?`, character classes, and recursive `**` globs.
 - Normal searches synchronize every selected snapshot before scanning. `--offline` explicitly uses the last cached commits.
+
+At most 20,000 matches per pattern per file are collected; beyond that the result is reported as truncated rather than failing.
 
 Useful automation options include `--format json`, `--format jsonl`, `--sort`, `--max-results`, `--context`, and `--no-cache`. Exit status is `0` for matches, `1` for no matches, and `2` for errors.
 

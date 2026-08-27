@@ -297,8 +297,10 @@ mod tests {
             atoms: vec![crate::query::AtomSpec {
                 source: "foo".into(),
                 kind: crate::query::AtomKind::Wildcard,
+                flags: String::new(),
             }],
             case_mode: CaseMode::Smart,
+            multiline: false,
         };
         let options = SearchOptions {
             sort: SortMode::Relevance,

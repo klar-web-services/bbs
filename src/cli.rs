@@ -15,6 +15,10 @@ pub struct Cli {
     #[arg(short = 'r', long)]
     pub regex: bool,
 
+    /// Let wildcards and `.` span line breaks.
+    #[arg(short = 'M', long)]
+    pub multiline: bool,
+
     /// Repositories as unique slugs, workspace/slug names, or UUIDs.
     #[arg(long, num_args = 1.., value_delimiter = ',')]
     pub repos: Vec<String>,
@@ -64,6 +68,7 @@ impl Cli {
             paths: self.paths.clone(),
             branch: self.branch.clone(),
             regex: self.regex,
+            multiline: self.multiline,
             case_mode: if self.ignore_case {
                 CaseMode::Ignore
             } else if self.case_sensitive {

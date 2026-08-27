@@ -24,6 +24,7 @@ pub struct SearchRequest {
     pub branch: Option<String>,
     pub regex: bool,
     pub case_mode: CaseMode,
+    pub multiline: bool,
     pub offline: bool,
     pub context: Option<usize>,
     pub max_results: Option<usize>,
@@ -40,6 +41,7 @@ impl Default for SearchRequest {
             branch: None,
             regex: false,
             case_mode: CaseMode::Smart,
+            multiline: false,
             offline: false,
             context: None,
             max_results: None,
@@ -84,7 +86,12 @@ impl BbsApp {
         progress: Progress,
         cancelled: Arc<AtomicBool>,
     ) -> Result<SearchResponse> {
-        let query = CompiledQuery::parse(&request.queries, request.regex, request.case_mode)?;
+        let query = CompiledQuery::parse(
+            &request.queries,
+            request.regex,
+            request.case_mode,
+            request.multiline,
+        )?;
         let lock_config = self.config.clone();
         let _search_lock =
             tokio::task::spawn_blocking(move || git_sync::lock_searches(&lock_config))

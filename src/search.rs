@@ -69,13 +69,14 @@ pub fn run(
     let positive = query.positive_atoms();
     let candidates = collect_candidates(snapshots, globset.as_ref(), options.max_file_bytes)?;
     let files_searched = candidates.len();
+    let capped = AtomicBool::new(false);
     let nested: Vec<Result<Option<SearchResult>>> = candidates
         .par_iter()
         .map(|(snapshot, path)| {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            search_file(query, snapshot, path, options.context, &positive)
+            search_file(query, snapshot, path, options.context, &positive, &capped)
         })
         .collect();
     let mut results = Vec::new();
@@ -102,7 +103,7 @@ pub fn run(
                 .then_with(|| a.repository.cmp(&b.repository))
         }),
     }
-    let truncated = results.len() > options.max_results;
+    let truncated = results.len() > options.max_results || capped.load(Ordering::Relaxed);
     results.truncate(options.max_results);
     Ok(SearchOutcome {
         response: SearchResponse {
@@ -174,6 +175,7 @@ fn search_file(
     path: &Path,
     context: usize,
     positive: &BTreeSet<usize>,
+    capped: &AtomicBool,
 ) -> Result<Option<SearchResult>> {
     let bytes = fs::read(path)?;
     if bytes.iter().take(8192).any(|byte| *byte == 0) {
@@ -185,7 +187,11 @@ fn search_file(
     };
     let mut matches: Vec<Vec<(usize, usize)>> = Vec::with_capacity(query.atoms.len());
     for atom in &query.atoms {
-        matches.push(atom.find_all(&bytes)?);
+        let found = atom.find_all(&bytes);
+        if found.truncated {
+            capped.store(true, Ordering::Relaxed);
+        }
+        matches.push(found.spans);
     }
     let present = matches
         .iter()
@@ -259,11 +265,7 @@ fn search_file(
     let path_bonus = query
         .atoms
         .iter()
-        .filter(|atom| {
-            atom.find_all(relative.as_bytes())
-                .map(|m| !m.is_empty())
-                .unwrap_or(false)
-        })
+        .filter(|atom| !atom.find_all(relative.as_bytes()).spans.is_empty())
         .count() as f64
         * 4.0;
     let generated_penalty = if relative.split('/').any(|part| {
@@ -352,8 +354,13 @@ mod tests {
             checkout: dir.path().into(),
             stale: false,
         };
-        let query =
-            CompiledQuery::parse(&["alpha AND beta".into()], false, CaseMode::Sensitive).unwrap();
+        let query = CompiledQuery::parse(
+            &["alpha AND beta".into()],
+            false,
+            CaseMode::Sensitive,
+            false,
+        )
+        .unwrap();
         let outcome = run(
             &query,
             &[snapshot],
