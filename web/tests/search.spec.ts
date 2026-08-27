@@ -172,3 +172,35 @@ test('renders overlapping and multi-token matches as one continuous highlight', 
   await expect(page.locator('.code-line').nth(1).locator('mark.is-start')).toHaveCount(1)
   await expect(page.locator('.code-line').nth(1).locator('mark.is-end')).toHaveCount(1)
 })
+
+test('shows a scanning animation while a search runs and clears it on completion', async ({ page }) => {
+  await page.route('**/api/v1/bootstrap', route => route.fulfill({ json: { csrf_token: 'test-csrf', version: '0.2.0', authenticated: true } }))
+  await page.route('**/api/v1/repositories', route => route.fulfill({ json: catalog }))
+  await page.route('**/api/v1/search', route => route.fulfill({ json: { id: '77777777-7777-4777-8777-777777777777' } }))
+  const response = { query: ['wanted'], results: [gappedResult], repositories_searched: 1, files_searched: 3, elapsed_ms: 5, cached: false, truncated: false }
+  let release: (() => void) | undefined
+  await page.route('**/api/v1/search/*/events', async route => {
+    await new Promise<void>(resolve => { release = resolve })
+    await route.fulfill({ status: 200, contentType: 'text/event-stream', body: `data: ${JSON.stringify({ type: 'done', response })}\n\n` })
+  })
+
+  await page.goto('/')
+  await page.getByLabel('Search query').fill('wanted')
+  await page.getByRole('button', { name: 'Search' }).click()
+
+  // while the stream is open the placeholder stands in for results
+  await expect(page.locator('.scanning')).toBeVisible()
+  await expect(page.locator('.scan-line')).toHaveCount(7)
+  await expect(page.locator('.spin')).toBeVisible()
+  await expect(page.locator('.caret')).toHaveCount(1)
+  await expect(page.getByText('Find the line that matters')).toHaveCount(0)
+
+  // the spinner advances through its frames rather than sitting on one glyph
+  const first = await page.locator('.spin').innerText()
+  await expect.poll(() => page.locator('.spin').innerText(), { timeout: 2000 }).not.toBe(first)
+
+  release!()
+  await expect(page.getByRole('article')).toBeVisible()
+  await expect(page.locator('.scanning')).toHaveCount(0)
+  await expect(page.locator('.spin')).toHaveCount(0)
+})

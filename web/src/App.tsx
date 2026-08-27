@@ -2,6 +2,9 @@ import { Fragment, FormEvent, useEffect, useMemo, useState } from 'react'
 import HighlightedLine from './HighlightedLine'
 import type { Bootstrap, Catalog, SearchEvent, SearchResponse, SearchResult } from './types'
 
+const SPINNER = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f']
+const SKELETON = [[46, 18, 92], [120, 40], [30, 74, 26, 58], [88, 34], [52, 110, 22], [64, 28, 46], [100, 36, 18]]
+
 const APPLE = typeof navigator !== 'undefined' && /Mac|iPhone|iPod|iPad/i.test(navigator.userAgent)
 const SHORTCUT = APPLE ? '\u2318 K' : 'Ctrl K'
 
@@ -91,12 +94,31 @@ export default function App() {
         <details className="repo-picker"><summary>{selectedRepos.length ? `${selectedRepos.length} repositories selected` : 'All accessible repositories'}</summary><div className="repo-menu"><input value={repoFilter} onChange={e => setRepoFilter(e.target.value)} placeholder="Filter repositories…"/><button type="button" onClick={() => setSelectedRepos([])}>All repositories</button>{visibleRepos.map(repo => <label key={repo.uuid}><input type="checkbox" checked={selectedRepos.includes(repo.full_name)} onChange={e => setSelectedRepos(current => e.target.checked ? [...current, repo.full_name] : current.filter(item => item !== repo.full_name))}/><span>{repo.full_name}</span><small>{repo.default_branch || 'empty'}</small></label>)}</div></details>
         <div className="grammar"><span>Boolean:</span> AND · OR · NOT · parentheses <i/> <span>Patterns:</span> wild*card · "exact phrase" · /regex/</div>
       </form>
-      <section className="result-meta"><div><strong>{status}</strong>{response.cached && <span className="badge">cache hit</span>}{offline && <span className="badge warning">offline</span>}</div>{response.files_searched > 0 && <span>{response.repositories_searched} repos · {response.files_searched.toLocaleString()} files · {response.elapsed_ms} ms</span>}</section>
+      <section className="result-meta"><div>{running && <Spinner/>}<strong>{status}</strong>{running && <span className="caret" aria-hidden="true"/>}{response.cached && <span className="badge">cache hit</span>}{offline && <span className="badge warning">offline</span>}</div>{response.files_searched > 0 && <span>{response.repositories_searched} repos · {response.files_searched.toLocaleString()} files · {response.elapsed_ms} ms</span>}</section>
       {error && <div className="error"><strong>Search stopped</strong><span>{error}</span></div>}
+      {running && response.results.length === 0 && <Scanning label={status}/>}
       {!running && !error && response.results.length === 0 && <div className="empty"><div className="empty-icon">⌕</div><h2>Find the line that matters</h2><p>Use Boolean expressions, wildcards, PCRE2 regexes, repository scopes, and path globs.</p></div>}
       <section className="results">{response.results.map(result => <ResultCard key={`${result.repository}:${result.path}`} result={result}/>)}</section>
     </main>
   </div>
+}
+
+function Spinner() {
+  const [frame, setFrame] = useState(0)
+  useEffect(() => {
+    const timer = setInterval(() => setFrame(current => (current + 1) % SPINNER.length), 80)
+    return () => clearInterval(timer)
+  }, [])
+  return <span className="spin" aria-hidden="true">{SPINNER[frame]}</span>
+}
+
+function Scanning({ label }: { label: string }) {
+  return <section className="scanning" role="status" aria-busy="true" aria-label={label}>
+    {SKELETON.map((widths, row) => <div className="scan-line" key={row} style={{ ['--delay' as string]: `${row * 90}ms` }}>
+      <span className="scan-number">{row + 12}</span>
+      <span className="scan-code">{widths.map((width, block) => <i key={block} style={{ width: `${width}px` }}/>)}</span>
+    </div>)}
+  </section>
 }
 
 function SearchMark() {
