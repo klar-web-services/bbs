@@ -60,7 +60,22 @@ export default function HighlightedLine({ line, path }: { line: ResultLine; path
       .catch(() => { if (active) setTokens([{ content: line.text, offset: 0 }]) })
     return () => { active = false }
   }, [line.text, path])
-  const ranges = useMemo(() => line.ranges.map(range => ({ start: byteToCodeUnit(line.text, range.start), end: byteToCodeUnit(line.text, range.end) })), [line])
+  // Different atoms routinely match overlapping spans of the same line, and a
+  // single match can straddle several syntax tokens. Coalesce first so one
+  // visually contiguous hit is one run, then mark only the run's outer edges.
+  const ranges = useMemo(() => {
+    const converted = line.ranges
+      .map(range => ({ start: byteToCodeUnit(line.text, range.start), end: byteToCodeUnit(line.text, range.end) }))
+      .filter(range => range.end > range.start)
+      .sort((a, b) => a.start - b.start || a.end - b.end)
+    const merged: { start: number; end: number }[] = []
+    for (const range of converted) {
+      const last = merged[merged.length - 1]
+      if (last && range.start <= last.end) last.end = Math.max(last.end, range.end)
+      else merged.push({ ...range })
+    }
+    return merged
+  }, [line])
 
   return <code>{tokens.flatMap((token, tokenIndex) => {
     const tokenStart = token.offset
@@ -68,10 +83,12 @@ export default function HighlightedLine({ line, path }: { line: ResultLine; path
     const points = [...new Set([tokenStart, tokenEnd, ...ranges.flatMap(r => [Math.max(tokenStart, r.start), Math.min(tokenEnd, r.end)])])].filter(p => p >= tokenStart && p <= tokenEnd).sort((a, b) => a - b)
     return points.slice(0, -1).map((start, index) => {
       const end = points[index + 1]
-      const matched = ranges.some(range => range.start < end && range.end > start)
+      const run = ranges.find(range => range.start < end && range.end > start)
       const content = line.text.slice(start, end)
       const style = { color: token.color }
-      return matched ? <mark key={`${tokenIndex}-${index}`} style={style}>{content}</mark> : <span key={`${tokenIndex}-${index}`} style={style}>{content}</span>
+      if (!run) return <span key={`${tokenIndex}-${index}`} style={style}>{content}</span>
+      const edges = `${run.start === start ? ' is-start' : ''}${run.end === end ? ' is-end' : ''}`
+      return <mark key={`${tokenIndex}-${index}`} className={`hit${edges}`} style={style}>{content}</mark>
     })
   })}</code>
 }

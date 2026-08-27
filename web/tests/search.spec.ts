@@ -133,3 +133,42 @@ test('shows the platform shortcut and a monospaced grammar row', async ({ page }
   const family = await page.locator('.grammar').evaluate(el => getComputedStyle(el).fontFamily)
   expect(family).toContain('monospace')
 })
+
+test('renders overlapping and multi-token matches as one continuous highlight', async ({ page }) => {
+  await page.route('**/api/v1/bootstrap', route => route.fulfill({ json: { csrf_token: 'test-csrf', version: '0.2.0', authenticated: true } }))
+  await page.route('**/api/v1/repositories', route => route.fulfill({ json: catalog }))
+  await page.route('**/api/v1/search', route => route.fulfill({ json: { id: '55555555-5555-4555-8555-555555555555' } }))
+  const text = 'bbs_actual=$(sha256sum "$bbs_asset")'
+  const at = text.indexOf('sha256sum')
+  const result = {
+    ...gappedResult, path: 'scripts/install.sh', lines: [
+      // /sha-?256/ matches six characters, the bare term sha256sum matches nine
+      { number: 36, text, ranges: [{ start: at, end: at + 6, atom: 0 }, { start: at, end: at + 9, atom: 1 }], is_context: false },
+      // one match straddling several shiki tokens
+      { number: 37, text: '  let digest = hex::encode(Sha256::digest(archive));', ranges: [{ start: 26, end: 47, atom: 2 }], is_context: false },
+    ],
+  }
+  const response = { query: ['sha256'], results: [result], repositories_searched: 1, files_searched: 7, elapsed_ms: 3, cached: false, truncated: false }
+  await page.route('**/api/v1/search/*/events', route => route.fulfill({
+    status: 200, contentType: 'text/event-stream',
+    body: `data: ${JSON.stringify({ type: 'done', response })}\n\n`,
+  }))
+  await page.goto('/')
+  await page.getByLabel('Search query').fill('sha256')
+  await page.getByRole('button', { name: 'Search' }).click()
+  await expect(page.getByRole('article')).toBeVisible()
+
+  // the two overlapping atoms must coalesce into a single mark, not two boxes
+  const overlapping = page.locator('.code-line').first().locator('mark')
+  await expect(overlapping).toHaveCount(1)
+  await expect(overlapping).toHaveText('sha256sum')
+  await expect(overlapping).toHaveClass(/is-start/)
+  await expect(overlapping).toHaveClass(/is-end/)
+
+  // a run crossing token boundaries may be several marks, but exactly one
+  // leading and one trailing edge, so it reads as one box
+  const straddling = page.locator('.code-line').nth(1).locator('mark')
+  expect(await straddling.count()).toBeGreaterThan(1)
+  await expect(page.locator('.code-line').nth(1).locator('mark.is-start')).toHaveCount(1)
+  await expect(page.locator('.code-line').nth(1).locator('mark.is-end')).toHaveCount(1)
+})

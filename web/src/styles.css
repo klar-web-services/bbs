@@ -530,13 +530,37 @@ main {
 }
 
 .code-line mark {
-  border-radius: 2px;
-  outline: 1px solid #b08b2e;
   background: #634c16;
+  box-shadow:
+    inset 0 1px 0 #b08b2e,
+    inset 0 -1px 0 #b08b2e;
   color: #fff !important;
   text-decoration: underline;
   text-decoration-color: #f9d66b;
   text-underline-offset: 2px;
+}
+
+.code-line mark.is-start {
+  border-top-left-radius: 2px;
+  border-bottom-left-radius: 2px;
+  box-shadow:
+    inset 0 1px 0 #b08b2e,
+    inset 0 -1px 0 #b08b2e,
+    inset 1px 0 0 #b08b2e;
+}
+
+.code-line mark.is-end {
+  border-top-right-radius: 2px;
+  border-bottom-right-radius: 2px;
+  box-shadow:
+    inset 0 1px 0 #b08b2e,
+    inset 0 -1px 0 #b08b2e,
+    inset -1px 0 0 #b08b2e;
+}
+
+.code-line mark.is-start.is-end {
+  border-radius: 2px;
+  box-shadow: inset 0 0 0 1px #b08b2e;
 }
 
 .code-gap {
