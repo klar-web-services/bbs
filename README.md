@@ -84,10 +84,10 @@ Query rules:
 - `NOT` binds before `AND`, which binds before `OR`.
 - Boolean expressions are evaluated at file level.
 - Multiple positional query expressions are ORed and deduplicated.
-- Bare and quoted terms are literal, with `*` and `?` wildcards constrained to one line.
+- Bare and quoted terms are literal, with `*` and `?` wildcards.
 - `/.../` is a PCRE2 atom inside a Boolean expression; `-r` treats each complete query as raw PCRE2.
 - `/.../` accepts trailing `i`, `s`, `m`, and `x` flags, so `/foo.*bar/s` spans lines.
-- Terms and `*` wildcards stay on one line. `--multiline` lets them cross line breaks, matching lazily so a wildcard stops at the nearest hit rather than the last one in the file.
+- Wildcards stay on one line, and `.` in a regex excludes newlines. `-M`/`--multiline` lets both cross line breaks, matching lazily so a wildcard stops at the nearest hit rather than the last one in the file.
 - To find two things in one file without caring where they sit, prefer `foo AND bar`: Boolean expressions are evaluated per file, so the terms may be lines apart.
 - Matching is smart-case by default; use `-i` or `-s` to override it.
 - `--path` accepts Git-style `*`, `?`, character classes, and recursive `**` globs.
