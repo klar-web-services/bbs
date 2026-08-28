@@ -95,6 +95,8 @@ Query rules:
 
 At most 20,000 matches per pattern per file are collected; beyond that the result is reported as truncated rather than failing.
 
+See [docs/usage.md](docs/usage.md) for the full reference: query grammar, scoping, output, ranking, freshness, cache, and configuration.
+
 Useful automation options include `--format json`, `--format jsonl`, `--sort`, `--max-results`, `--context`, and `--no-cache`. Exit status is `0` for matches, `1` for no matches, and `2` for errors.
 
 ## Cache and privacy
