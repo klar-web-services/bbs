@@ -92,8 +92,12 @@ Query rules:
 - Matching is smart-case by default; use `-i` or `-s` to override it.
 - A query needs at least one positive term: `NOT x` alone is refused, `foo AND NOT x` is fine.
 - Repositories with no commits, or without the requested branch, are skipped with a warning rather than failing the search.
-- `--path` accepts Git-style `*`, `?`, character classes, and recursive `**` globs.
-- Normal searches synchronize every selected snapshot before scanning. `--offline` explicitly uses the last cached commits.
+- `-w`/`--word` requires a word boundary either side of every term, without the case surprises of writing `/\bfoo\b/` by hand.
+- A pattern that matches at every position -- `""`, `//`, `*`, `?` -- is refused rather than run.
+- `--path` accepts Git-style `*`, `?`, character classes, and recursive `**` globs. A pattern with no `/` matches at any depth; `./x` anchors it to the root.
+- `--exclude-path`, a leading `!` in `--path`, and `--no-vendor` remove paths; `NOT` only ever excluded on content.
+- `--sort`, `--max-results`, `--context`, `-l` and `--count` change only what is shown, so they never force a rescan.
+- Normal searches synchronize every selected snapshot before scanning. `--max-age 5m` reuses anything fetched recently; `--offline` explicitly uses the last cached commits.
 
 At most 20,000 matches per pattern per file are collected; beyond that the result is reported as truncated rather than failing.
 
