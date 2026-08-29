@@ -2,10 +2,10 @@ use crate::{
     model::{
         MatchRange, ResultLine, SearchResponse, SearchResult, SkippedFiles, Snapshot, Truncation,
     },
+    paths::{FilterCounts, PathFilter, VENDOR_DIRECTORIES, Verdict},
     query::{CompiledQuery, QueryFingerprint},
 };
-use anyhow::{Context, Result};
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,6 +24,10 @@ use walkdir::WalkDir;
 #[serde(default)]
 pub struct SearchOptions {
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+    #[serde(default)]
+    pub no_vendor: bool,
     pub context: usize,
     pub max_results: usize,
     pub max_file_bytes: u64,
@@ -34,6 +38,8 @@ impl Default for SearchOptions {
     fn default() -> Self {
         Self {
             paths: vec![],
+            exclude_paths: vec![],
+            no_vendor: false,
             context: 2,
             max_results: 500,
             max_file_bytes: 4 * 1024 * 1024,
@@ -58,6 +64,10 @@ pub struct SearchFingerprint {
 
 pub struct SearchOutcome {
     pub response: SearchResponse,
+    /// What the path filter did, so a filter that removed everything can be
+    /// reported rather than looking like an empty result set.
+    pub filter_counts: FilterCounts,
+    pub filter: PathFilter,
 }
 
 /// Tallies kept while scanning. Files dropped for size, binary content or
@@ -94,15 +104,11 @@ pub fn run(
     cancelled: Arc<AtomicBool>,
 ) -> Result<SearchOutcome> {
     let started = Instant::now();
-    let globset = build_globs(&options.paths)?;
+    let filter = PathFilter::new(&options.paths, &options.exclude_paths, options.no_vendor)?;
     let positive = query.positive_atoms();
     let counters = ScanCounters::default();
-    let candidates = collect_candidates(
-        snapshots,
-        globset.as_ref(),
-        options.max_file_bytes,
-        &counters,
-    )?;
+    let (candidates, filter_counts) =
+        collect_candidates(snapshots, &filter, options.max_file_bytes, &counters)?;
     let files_searched = candidates.len();
     let nested: Vec<Result<Option<SearchResult>>> = candidates
         .par_iter()
@@ -146,6 +152,8 @@ pub fn run(
     results.truncate(options.max_results);
     let elapsed_ms = started.elapsed().as_millis();
     Ok(SearchOutcome {
+        filter_counts,
+        filter,
         response: SearchResponse {
             query: query.sources.clone(),
             results,
@@ -165,31 +173,14 @@ pub fn run(
     })
 }
 
-fn build_globs(patterns: &[String]) -> Result<Option<GlobSet>> {
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let normalized = pattern.replace('\\', "/");
-        builder.add(
-            GlobBuilder::new(&normalized)
-                .literal_separator(true)
-                .backslash_escape(false)
-                .build()
-                .with_context(|| format!("invalid path glob `{pattern}`"))?,
-        );
-    }
-    Ok(Some(builder.build()?))
-}
-
 fn collect_candidates<'a>(
     snapshots: &'a [Snapshot],
-    globs: Option<&GlobSet>,
+    filter: &PathFilter,
     max_bytes: u64,
     counters: &ScanCounters,
-) -> Result<Vec<(&'a Snapshot, std::path::PathBuf)>> {
+) -> Result<(Vec<(&'a Snapshot, std::path::PathBuf)>, FilterCounts)> {
     let mut output = Vec::new();
+    let mut counts = FilterCounts::default();
     for snapshot in snapshots {
         for entry in WalkDir::new(&snapshot.checkout)
             .follow_links(false)
@@ -204,18 +195,27 @@ fn collect_candidates<'a>(
                 ScanCounters::bump(&counters.too_large);
                 continue;
             }
+            counts.considered += 1;
             let relative = entry
                 .path()
                 .strip_prefix(&snapshot.checkout)?
                 .to_string_lossy()
                 .replace('\\', "/");
-            if globs.is_some_and(|set| !set.is_match(&relative)) {
-                continue;
+            match filter.verdict(&relative) {
+                Verdict::Selected => counts.selected += 1,
+                Verdict::DroppedByInclude => {
+                    counts.dropped_by_include += 1;
+                    continue;
+                }
+                Verdict::DroppedByExclude => {
+                    counts.dropped_by_exclude += 1;
+                    continue;
+                }
             }
             output.push((snapshot, entry.path().to_path_buf()));
         }
     }
-    Ok(output)
+    Ok((output, counts))
 }
 
 fn search_file(
@@ -335,12 +335,10 @@ fn search_file(
         .filter(|atom| !atom.find_all(relative.as_bytes()).spans.is_empty())
         .count() as f64
         * 4.0;
-    let generated_penalty = if relative.split('/').any(|part| {
-        matches!(
-            part.to_ascii_lowercase().as_str(),
-            "vendor" | "generated" | "dist" | "build" | "node_modules"
-        )
-    }) {
+    let generated_penalty = if relative
+        .split('/')
+        .any(|part| VENDOR_DIRECTORIES.contains(&part.to_ascii_lowercase().as_str()))
+    {
         8.0
     } else {
         0.0
@@ -571,6 +569,129 @@ mod tests {
         assert!(!outcome.response.truncation.pattern_gave_up);
         // the compatibility boolean still summarises all three
         assert!(outcome.response.truncated);
+    }
+
+    /// The headline path-filter behaviours, end to end. `--path '*.md'` used
+    /// to find only the root-level file, and there was no way at all to
+    /// exclude a directory.
+    #[test]
+    fn path_filters_widen_by_depth_and_narrow_by_exclusion() {
+        let dir = tempdir().unwrap();
+        for (path, text) in [
+            ("README.md", "needle\n"),
+            ("docs/guide.md", "needle\n"),
+            ("src/main.rs", "needle\n"),
+            ("vendor/dep.rs", "needle\n"),
+            ("src/test/case.rs", "needle\n"),
+        ] {
+            let file = dir.path().join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, text).unwrap();
+        }
+        let snapshot = snapshot_of(dir.path());
+        let query =
+            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let found = |options: SearchOptions| {
+            let outcome = run(
+                &query,
+                std::slice::from_ref(&snapshot),
+                &options,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            let mut paths: Vec<String> = outcome
+                .response
+                .results
+                .iter()
+                .map(|result| result.path.clone())
+                .collect();
+            paths.sort();
+            paths
+        };
+
+        // a pattern with no separator reaches every depth
+        assert_eq!(
+            found(SearchOptions {
+                paths: vec!["*.md".into()],
+                ..Default::default()
+            }),
+            ["README.md", "docs/guide.md"]
+        );
+        // and `./` is the way back to the repository root alone
+        assert_eq!(
+            found(SearchOptions {
+                paths: vec!["./*.md".into()],
+                ..Default::default()
+            }),
+            ["README.md"]
+        );
+        // spellings that used to match nothing without saying so
+        assert_eq!(
+            found(SearchOptions {
+                paths: vec!["src/".into()],
+                ..Default::default()
+            }),
+            ["src/main.rs", "src/test/case.rs"]
+        );
+        assert_eq!(
+            found(SearchOptions {
+                paths: vec!["./src/**".into()],
+                ..Default::default()
+            }),
+            ["src/main.rs", "src/test/case.rs"]
+        );
+        // exclusion, in both spellings
+        assert_eq!(
+            found(SearchOptions {
+                exclude_paths: vec!["**/test/**".into()],
+                paths: vec!["*.rs".into()],
+                ..Default::default()
+            }),
+            ["src/main.rs", "vendor/dep.rs"]
+        );
+        assert_eq!(
+            found(SearchOptions {
+                paths: vec!["*.rs".into(), "!vendor/**".into()],
+                ..Default::default()
+            }),
+            ["src/main.rs", "src/test/case.rs"]
+        );
+        assert_eq!(
+            found(SearchOptions {
+                paths: vec!["*.rs".into()],
+                no_vendor: true,
+                ..Default::default()
+            }),
+            ["src/main.rs", "src/test/case.rs"]
+        );
+    }
+
+    /// A filter that eliminates everything must say so rather than looking
+    /// like an empty result set.
+    #[test]
+    fn a_path_filter_that_selects_nothing_is_reported() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "needle\n").unwrap();
+        let snapshot = snapshot_of(dir.path());
+        let query =
+            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let outcome = run(
+            &query,
+            std::slice::from_ref(&snapshot),
+            &SearchOptions {
+                paths: vec!["nowhere/**".into()],
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(outcome.response.results.is_empty());
+        let warning = outcome
+            .filter
+            .empty_result_warning(&outcome.filter_counts)
+            .expect("a filter that selected nothing must be reported");
+        assert!(warning.contains("nowhere/**"), "{warning}");
+        assert!(warning.contains('1'), "{warning}");
     }
 
     #[test]

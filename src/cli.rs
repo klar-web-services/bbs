@@ -23,9 +23,19 @@ pub struct Cli {
     #[arg(long, num_args = 1.., value_delimiter = ',')]
     pub repos: Vec<String>,
 
-    /// Git-style path glob. May be repeated.
+    /// Git-style path glob. May be repeated. A pattern with no `/` matches at
+    /// any depth; prefix `./` for the repository root only, `!` to exclude.
     #[arg(long = "path")]
     pub paths: Vec<String>,
+
+    /// Exclude paths matching this glob. May be repeated. Equivalent to
+    /// `--path '!<glob>'`.
+    #[arg(long = "exclude-path")]
+    pub exclude_paths: Vec<String>,
+
+    /// Exclude vendor, generated, dist, build and node_modules trees.
+    #[arg(long)]
+    pub no_vendor: bool,
 
     /// Search this branch instead of each repository's default branch.
     #[arg(long)]
@@ -66,6 +76,8 @@ impl Cli {
             queries: self.queries.clone(),
             repositories: self.repos.clone(),
             paths: self.paths.clone(),
+            exclude_paths: self.exclude_paths.clone(),
+            no_vendor: self.no_vendor,
             branch: self.branch.clone(),
             regex: self.regex,
             multiline: self.multiline,

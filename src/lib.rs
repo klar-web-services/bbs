@@ -7,6 +7,7 @@ pub mod config;
 pub mod git_sync;
 pub mod model;
 pub mod output;
+pub mod paths;
 pub mod query;
 pub mod search;
 pub mod server;

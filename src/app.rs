@@ -21,6 +21,10 @@ pub struct SearchRequest {
     pub queries: Vec<String>,
     pub repositories: Vec<String>,
     pub paths: Vec<String>,
+    /// Path globs to remove from the search. `--path '!glob'` lands here too.
+    pub exclude_paths: Vec<String>,
+    /// Shorthand for excluding the directories the ranking already demotes.
+    pub no_vendor: bool,
     pub branch: Option<String>,
     pub regex: bool,
     pub case_mode: CaseMode,
@@ -38,6 +42,8 @@ impl Default for SearchRequest {
             queries: vec![],
             repositories: vec![],
             paths: vec![],
+            exclude_paths: vec![],
+            no_vendor: false,
             branch: None,
             regex: false,
             case_mode: CaseMode::Smart,
@@ -187,6 +193,8 @@ impl BbsApp {
         let sync_ms = started.elapsed().as_millis();
         let options = SearchOptions {
             paths: request.paths,
+            exclude_paths: request.exclude_paths,
+            no_vendor: request.no_vendor,
             context: request.context.unwrap_or(self.config.context_lines),
             max_results: request.max_results.unwrap_or(self.config.max_results),
             max_file_bytes: self.config.max_file_bytes,
@@ -221,7 +229,7 @@ impl BbsApp {
         let query = Arc::new(query);
         let options_for_search = options.clone();
         let cancelled_for_search = cancelled.clone();
-        let response = tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             search::run(
                 &query,
                 &snapshots,
@@ -230,9 +238,14 @@ impl BbsApp {
             )
         })
         .await
-        .context("search task failed")??
-        .response;
-        let mut response = response;
+        .context("search task failed")??;
+        // A path filter that removed every candidate is nearly always a typo,
+        // and silence about it reads as "no matches" rather than "that glob
+        // selected nothing".
+        if let Some(warning) = outcome.filter.empty_result_warning(&outcome.filter_counts) {
+            (progress)(SearchEvent::Warning { message: warning });
+        }
+        let mut response = outcome.response;
         response.skipped = skipped;
         response.offline = request.offline;
         response.sync_ms = sync_ms;
