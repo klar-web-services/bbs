@@ -1,8 +1,8 @@
 use crate::{
     config::Config,
-    model::{RepositoryCatalog, SearchResponse, Snapshot},
+    model::{RepositoryCatalog, Snapshot},
     query::QueryFingerprint,
-    search::SearchOptions,
+    search::{CachedScan, ScanOptions},
 };
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -14,19 +14,25 @@ use std::{
     time::SystemTime,
 };
 
-const CACHE_SCHEMA: u32 = 1;
+/// Bumped when the stored body changes shape. Entries under an older schema
+/// simply become unreachable and are reclaimed by `bbs cache prune`.
+const CACHE_SCHEMA: u32 = 2;
 
+/// The key covers the query, what was scanned, and the exact commits scanned -
+/// and nothing about how the results were displayed. `--sort`, `--max-results`
+/// and `--context` are applied when rendering, so re-asking for the same scan
+/// in a different order is a hit rather than a rescan of every file.
 #[derive(Serialize)]
 struct CacheKey<'a> {
     schema: u32,
     query: &'a QueryFingerprint,
-    options: &'a SearchOptions,
+    scan: &'a ScanOptions,
     snapshots: Vec<(&'a str, &'a str, &'a str)>,
 }
 
 pub fn result_key(
     query: &QueryFingerprint,
-    options: &SearchOptions,
+    scan: &ScanOptions,
     snapshots: &[Snapshot],
 ) -> Result<String> {
     let mut ordered = snapshots.iter().collect::<Vec<_>>();
@@ -39,7 +45,7 @@ pub fn result_key(
     let key = CacheKey {
         schema: CACHE_SCHEMA,
         query,
-        options,
+        scan,
         snapshots: ordered
             .into_iter()
             .map(|s| {
@@ -54,7 +60,7 @@ pub fn result_key(
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&key)?)))
 }
 
-pub fn load_result(config: &Config, key: &str) -> Result<Option<SearchResponse>> {
+pub fn load_result(config: &Config, key: &str) -> Result<Option<CachedScan>> {
     let path = result_path(config, key);
     if !path.exists() {
         return Ok(None);
@@ -75,13 +81,12 @@ pub fn load_result(config: &Config, key: &str) -> Result<Option<SearchResponse>>
         let _ = fs::remove_file(path);
         return Ok(None);
     }
-    match serde_json::from_slice::<SearchResponse>(&bytes) {
-        Ok(mut response) => {
+    match serde_json::from_slice::<CachedScan>(&bytes) {
+        Ok(scan) => {
             if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
                 let _ = file.set_modified(SystemTime::now());
             }
-            response.cached = true;
-            Ok(Some(response))
+            Ok(Some(scan))
         }
         Err(_) => {
             let _ = fs::remove_file(path);
@@ -90,13 +95,13 @@ pub fn load_result(config: &Config, key: &str) -> Result<Option<SearchResponse>>
     }
 }
 
-pub fn save_result(config: &Config, key: &str, response: &SearchResponse) -> Result<()> {
+pub fn save_result(config: &Config, key: &str, scan: &CachedScan) -> Result<()> {
     fs::create_dir_all(config.results_dir())?;
     let target = result_path(config, key);
     let temp = tempfile::NamedTempFile::new_in(config.results_dir())?;
     {
         let mut encoder = zstd::Encoder::new(temp.as_file(), 3)?;
-        encoder.write_all(&serde_json::to_vec(response)?)?;
+        encoder.write_all(&serde_json::to_vec(scan)?)?;
         encoder.finish()?;
     }
     temp.persist(&target).map_err(|error| error.error)?;
@@ -282,9 +287,9 @@ fn snapshot_entries(config: &Config) -> Result<Vec<SnapshotEntry>> {
 mod tests {
     use super::*;
     use crate::{
-        model::{Repository, SearchResponse},
+        model::{Repository, SkippedFiles},
         query::CaseMode,
-        search::SortMode,
+        search::{Presentation, SortMode},
     };
     use chrono::Utc;
     use tempfile::tempdir;
@@ -302,10 +307,7 @@ mod tests {
             case_mode: CaseMode::Smart,
             multiline: false,
         };
-        let options = SearchOptions {
-            sort: SortMode::Relevance,
-            ..Default::default()
-        };
+        let scan = ScanOptions::default();
         let repository = Repository {
             uuid: "1".into(),
             workspace: "w".into(),
@@ -325,8 +327,20 @@ mod tests {
             stale: false,
         };
         assert_ne!(
-            result_key(&query, &options, &[snapshot("one")]).unwrap(),
-            result_key(&query, &options, &[snapshot("two")]).unwrap()
+            result_key(&query, &scan, &[snapshot("one")]).unwrap(),
+            result_key(&query, &scan, &[snapshot("two")]).unwrap()
+        );
+
+        // The whole point of the split: how results are displayed must not
+        // change the key, or re-running a query with a different `--sort`
+        // rescans every file to reach the same answer in a different order.
+        let widened = ScanOptions {
+            paths: vec!["src/**".into()],
+            ..Default::default()
+        };
+        assert_ne!(
+            result_key(&query, &scan, &[snapshot("one")]).unwrap(),
+            result_key(&query, &widened, &[snapshot("one")]).unwrap()
         );
     }
 
@@ -339,17 +353,34 @@ mod tests {
             ..Default::default()
         };
         config.ensure_dirs().unwrap();
-        let response = SearchResponse {
-            query: vec!["foo".into()],
+        let scan = CachedScan {
             results: vec![],
+            total_results: 0,
+            stored_context: 6,
+            stored_limit: 1000,
+            complete: true,
+            stored_sort: SortMode::Relevance,
             repositories_searched: 1,
             files_searched: 2,
-            elapsed_ms: 3,
-            ..Default::default()
+            skipped_files: SkippedFiles::default(),
+            matches_capped_files: 0,
+            pattern_gave_up_files: 0,
+            scan_ms: 3,
         };
-        save_result(&config, "key", &response).unwrap();
+        save_result(&config, "key", &scan).unwrap();
         let loaded = load_result(&config, "key").unwrap().unwrap();
-        assert!(loaded.cached);
         assert_eq!(loaded.files_searched, 2);
+        // a complete body answers any narrower presentation
+        assert!(loaded.satisfies(&Presentation {
+            sort: SortMode::Path,
+            max_results: 500,
+            context: 2,
+        }));
+        // but not one asking for more context than was stored
+        assert!(!loaded.satisfies(&Presentation {
+            sort: SortMode::Relevance,
+            max_results: 500,
+            context: 20,
+        }));
     }
 }

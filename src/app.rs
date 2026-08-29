@@ -6,7 +6,7 @@ use crate::{
     git_sync,
     model::{RepositoryCatalog, SearchEvent, SearchResponse, SkippedRepository, Snapshot},
     query::{CaseMode, CompiledQuery},
-    search::{self, SearchOptions, SortMode},
+    search::{self, Presentation, ScanOptions as SearchOptions, SortMode},
 };
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream};
@@ -99,6 +99,7 @@ impl BbsApp {
             request.case_mode,
             request.multiline,
         )?;
+        let query_sources = query.sources.clone();
         let lock_config = self.config.clone();
         let _search_lock =
             tokio::task::spawn_blocking(move || git_sync::lock_searches(&lock_config))
@@ -191,71 +192,84 @@ impl BbsApp {
         // Fetching seventy repositories and scanning them are very different
         // costs, and one `elapsed_ms` could not tell them apart.
         let sync_ms = started.elapsed().as_millis();
-        let options = SearchOptions {
+        let scan_options = SearchOptions {
             paths: request.paths,
             exclude_paths: request.exclude_paths,
             no_vendor: request.no_vendor,
-            context: request.context.unwrap_or(self.config.context_lines),
-            max_results: request.max_results.unwrap_or(self.config.max_results),
             max_file_bytes: self.config.max_file_bytes,
-            sort: request.sort,
         };
-        let key = cache::result_key(&query.normalized(), &options, &snapshots)?;
-        if !request.no_cache
-            && let Some(mut response) = cache::load_result(&self.config, &key)?
-        {
-            response.skipped = skipped;
-            response.offline = request.offline;
-            response.sync_ms = sync_ms;
-            response.scan_ms = 0;
-            response.elapsed_ms = started.elapsed().as_millis();
-            // Freshness describes this run, not the run that populated the
-            // cache. The cached body is keyed on exact commits so its content
-            // is right either way, but an offline hit must not inherit the
-            // "verified against the remote" label from an earlier online
-            // search, nor the reverse.
-            restamp_freshness(&mut response, &snapshots);
-            (progress)(SearchEvent::Done {
-                response: response.clone(),
-            });
-            return Ok(response);
-        }
-        (progress)(SearchEvent::Progress {
-            phase: "search".into(),
-            message: "Scanning synchronized snapshots".into(),
-            current: 0,
-            total: snapshots.len(),
-        });
-        let query = Arc::new(query);
-        let options_for_search = options.clone();
-        let cancelled_for_search = cancelled.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            search::run(
-                &query,
-                &snapshots,
-                &options_for_search,
-                cancelled_for_search,
-            )
-        })
-        .await
-        .context("search task failed")??;
-        // A path filter that removed every candidate is nearly always a typo,
-        // and silence about it reads as "no matches" rather than "that glob
-        // selected nothing".
-        if let Some(warning) = outcome.filter.empty_result_warning(&outcome.filter_counts) {
-            (progress)(SearchEvent::Warning { message: warning });
-        }
-        let mut response = outcome.response;
+        let presentation = Presentation {
+            sort: request.sort,
+            max_results: request.max_results.unwrap_or(self.config.max_results),
+            context: request.context.unwrap_or(self.config.context_lines),
+        };
+        // The scan is stored at least as wide as the configured cache window,
+        // so a later, narrower request for context or results is answered by
+        // trimming rather than by walking every file again.
+        let stored = Presentation {
+            sort: presentation.sort,
+            max_results: presentation.max_results.max(self.config.cache_max_results),
+            context: presentation.context.max(self.config.cache_context_lines),
+        };
+        let key = cache::result_key(&query.normalized(), &scan_options, &snapshots)?;
+        let cached = if request.no_cache {
+            None
+        } else {
+            cache::load_result(&self.config, &key)?
+        };
+        let (scan, cached_hit) = match cached {
+            Some(scan) if scan.satisfies(&presentation) => (scan, true),
+            _ => {
+                (progress)(SearchEvent::Progress {
+                    phase: "search".into(),
+                    message: "Scanning synchronized snapshots".into(),
+                    current: 0,
+                    total: snapshots.len(),
+                });
+                let query = Arc::new(query);
+                let scan_for_search = scan_options.clone();
+                let stored_for_search = stored;
+                let cancelled_for_search = cancelled.clone();
+                let snapshots_for_search = snapshots.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    search::run(
+                        &query,
+                        &snapshots_for_search,
+                        &scan_for_search,
+                        &stored_for_search,
+                        cancelled_for_search,
+                    )
+                })
+                .await
+                .context("search task failed")??;
+                // A path filter that removed every candidate is nearly always a
+                // typo, and silence about it reads as "no matches" rather than
+                // "that glob selected nothing".
+                if let Some(warning) = outcome.filter.empty_result_warning(&outcome.filter_counts) {
+                    (progress)(SearchEvent::Warning { message: warning });
+                }
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    bail!("search cancelled");
+                }
+                if !request.no_cache {
+                    cache::save_result(&self.config, &key, &outcome.scan)?;
+                }
+                (outcome.scan, false)
+            }
+        };
+        let mut response = search::present(&scan, &presentation, &query_sources);
         response.skipped = skipped;
         response.offline = request.offline;
+        response.cached = cached_hit;
         response.sync_ms = sync_ms;
+        response.scan_ms = if cached_hit { 0 } else { scan.scan_ms };
         response.elapsed_ms = started.elapsed().as_millis();
-        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            bail!("search cancelled");
-        }
-        if !request.no_cache {
-            cache::save_result(&self.config, &key, &response)?;
-        }
+        // Freshness describes this run, not the run that populated the cache.
+        // The cached body is keyed on exact commits so its content is right
+        // either way, but an offline hit must not inherit the "verified
+        // against the remote" label from an earlier online search, nor the
+        // reverse.
+        restamp_freshness(&mut response, &snapshots);
         for result in &response.results {
             (progress)(SearchEvent::Result {
                 result: result.clone(),
@@ -359,6 +373,106 @@ mod tests {
             .unwrap();
         assert!(second.cached);
         assert_eq!(second.results[0].path, "service.rs");
+    }
+
+    /// Presentation must not be part of the cache key. Re-running the same
+    /// query with a different `--sort`, a smaller `--context` or a smaller
+    /// `--max-results` used to rescan every file to reach the same answer in a
+    /// different shape.
+    #[tokio::test]
+    async fn changing_only_the_presentation_is_a_cache_hit() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let repository = Repository {
+            uuid: "{repo}".into(),
+            workspace: "team".into(),
+            slug: "api".into(),
+            name: "API".into(),
+            full_name: "team/api".into(),
+            default_branch: Some("main".into()),
+            clone_url: "https://example.invalid/team/api.git".into(),
+            web_url: "https://example.invalid/team/api".into(),
+        };
+        let checkout = git_sync::snapshot_path(&config, &repository, "main");
+        fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+        let git = GitRepository::init(&checkout).unwrap();
+        for name in ["b.rs", "a.rs"] {
+            fs::write(checkout.join(name), "one\ntwo\nwanted_symbol\nfour\nfive\n").unwrap();
+        }
+        let mut index = git.index().unwrap();
+        index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_id).unwrap();
+        let signature = Signature::now("bbs", "bbs@example.invalid").unwrap();
+        git.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        cache::save_catalog(
+            &config,
+            &RepositoryCatalog {
+                discovered_at: Utc::now(),
+                workspaces: vec![],
+                repositories: vec![repository],
+            },
+        )
+        .unwrap();
+        let app = BbsApp::new(config).unwrap();
+        let progress: Progress = Arc::new(|_| {});
+        let run = async |request: SearchRequest| {
+            app.search(request, progress.clone(), Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap()
+        };
+        let base = SearchRequest {
+            queries: vec!["wanted_symbol".into()],
+            offline: true,
+            ..Default::default()
+        };
+
+        let first = run(base.clone()).await;
+        assert!(!first.cached);
+        assert_eq!(first.results.len(), 2);
+
+        // a different sort order
+        let sorted = run(SearchRequest {
+            sort: SortMode::Path,
+            ..base.clone()
+        })
+        .await;
+        assert!(sorted.cached, "changing --sort must not rescan");
+        assert_eq!(sorted.results[0].path, "a.rs");
+
+        // a narrower context, correctly narrowed
+        let narrow = run(SearchRequest {
+            context: Some(1),
+            ..base.clone()
+        })
+        .await;
+        assert!(narrow.cached, "changing --context must not rescan");
+        assert_eq!(
+            narrow.results[0]
+                .lines
+                .iter()
+                .map(|line| line.number)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+
+        // a smaller limit, with the true total still reported
+        let limited = run(SearchRequest {
+            max_results: Some(1),
+            ..base.clone()
+        })
+        .await;
+        assert!(limited.cached, "changing --max-results must not rescan");
+        assert_eq!(limited.results.len(), 1);
+        assert_eq!(limited.total_results, 2);
+        assert!(limited.truncation.results_capped);
     }
 
     /// A cache hit must report the freshness of *this* search. An offline hit

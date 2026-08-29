@@ -16,6 +16,13 @@ pub struct Config {
     pub max_file_bytes: u64,
     pub max_results: usize,
     pub context_lines: usize,
+    /// Context lines kept in the result cache, so a later `--context` narrower
+    /// than this is served by trimming rather than by rescanning.
+    pub cache_context_lines: usize,
+    /// Results kept in the result cache, independent of `--max-results`. A
+    /// scan whose matches all fit here can be re-displayed in any sort order
+    /// without touching a file.
+    pub cache_max_results: usize,
     pub snapshot_budget_gb: u64,
     pub result_budget_mb: u64,
     #[serde(skip)]
@@ -41,6 +48,8 @@ impl Default for Config {
             max_file_bytes: 4 * 1024 * 1024,
             max_results: 500,
             context_lines: 2,
+            cache_context_lines: 6,
+            cache_max_results: 2000,
             snapshot_budget_gb: 20,
             result_budget_mb: 1024,
             config_dir,
