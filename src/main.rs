@@ -134,8 +134,10 @@ async fn run() -> Result<u8> {
                 .await;
             spinner.finish_and_clear();
             let response = search?;
-            output::render(&response, cli.format, cli.color)?;
-            Ok(if response.results.is_empty() { 1 } else { 0 })
+            output::render(&response, cli.render_options())?;
+            // Based on what matched, not on what was displayed: `--max-results
+            // 0` used to report "no matches" for a query with hundreds.
+            Ok(if response.total_results == 0 { 1 } else { 0 })
         }
     }
 }

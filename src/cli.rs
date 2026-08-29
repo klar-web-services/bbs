@@ -1,4 +1,9 @@
-use crate::{app::SearchRequest, query::CaseMode, search::SortMode};
+use crate::{
+    app::SearchRequest,
+    output::{OutputMode, RenderOptions},
+    query::CaseMode,
+    search::SortMode,
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -64,6 +69,18 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "relevance")]
     pub sort: CliSort,
 
+    /// Print only the repository and path of each matching file.
+    #[arg(short = 'l', long, conflicts_with = "count")]
+    pub files_with_matches: bool,
+
+    /// Print the match count for each matching file.
+    #[arg(long)]
+    pub count: bool,
+
+    /// Break out synchronization time from scan time.
+    #[arg(long)]
+    pub stats: bool,
+
     #[arg(long, value_enum, default_value = "terminal")]
     pub format: OutputFormat,
 
@@ -98,6 +115,23 @@ impl Cli {
             max_results: self.max_results,
             sort: self.sort.into(),
             no_cache: self.no_cache,
+        }
+    }
+
+    pub fn render_options(&self) -> RenderOptions {
+        RenderOptions {
+            format: self.format,
+            color: self.color,
+            mode: if self.files_with_matches {
+                OutputMode::FilesWithMatches
+            } else if self.count {
+                OutputMode::Count
+            } else {
+                OutputMode::Full
+            },
+            // Only meaningful when the list is actually ordered by repository.
+            group_by_repository: matches!(self.sort, CliSort::Repo),
+            stats: self.stats,
         }
     }
 }
