@@ -67,12 +67,40 @@ impl Default for SearchRequest {
 #[derive(Clone)]
 pub struct BbsApp {
     pub config: Config,
+    /// Overrides the credential store.
+    ///
+    /// Without it there was no seam for testing the online path at all:
+    /// discovery already honours `config.api_base`, but the token could only
+    /// come from the process environment or the OS keyring, both of which are
+    /// global and cannot be set safely from a parallel test. An "online" test
+    /// therefore hit the real network.
+    token: Option<String>,
 }
 
 impl BbsApp {
     pub fn new(config: Config) -> Result<Self> {
         config.ensure_dirs()?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            token: None,
+        })
+    }
+
+    /// Builds an application that authenticates with `token` rather than
+    /// consulting the environment or the credential store.
+    pub fn with_token(config: Config, token: impl Into<String>) -> Result<Self> {
+        config.ensure_dirs()?;
+        Ok(Self {
+            config,
+            token: Some(token.into()),
+        })
+    }
+
+    fn token(&self) -> Result<String> {
+        match &self.token {
+            Some(token) => Ok(token.clone()),
+            None => auth::token(),
+        }
     }
 
     /// Discovers the accessible repositories, or reuses a recent discovery.
@@ -107,7 +135,7 @@ impl BbsApp {
                 }
             };
         }
-        let client = BitbucketClient::new(&self.config.api_base, auth::token()?)?;
+        let client = BitbucketClient::new(&self.config.api_base, self.token()?)?;
         let catalog = client.discover().await?;
         cache::save_catalog(&self.config, &catalog)?;
         Ok(catalog)
@@ -160,7 +188,7 @@ impl BbsApp {
         let token = if request.offline {
             None
         } else {
-            Some(auth::token()?)
+            Some(self.token()?)
         };
         let total = repositories.len();
         let config = self.config.clone();
@@ -416,6 +444,139 @@ mod tests {
             .unwrap();
         assert!(second.cached);
         assert_eq!(second.results[0].path, "service.rs");
+    }
+
+    /// The whole online path -- discovery, catalog write, a real clone, the
+    /// scan, and the result cache -- against a stub API and a local Git
+    /// remote. There was previously no seam for this at all: an "online" test
+    /// silently reached the real network and took nearly two minutes.
+    #[tokio::test]
+    async fn the_online_path_runs_end_to_end_against_a_stub_api() {
+        use axum::{Router, routing::get};
+
+        let temp = tempdir().unwrap();
+
+        // a real Git remote on disk, so `synchronize` genuinely clones
+        let remote = temp.path().join("remote");
+        let git = GitRepository::init(&remote).unwrap();
+        fs::write(remote.join("service.rs"), "fn wanted_symbol() {}\n").unwrap();
+        let mut index = git.index().unwrap();
+        index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_id).unwrap();
+        let signature = Signature::now("bbs", "bbs@example.invalid").unwrap();
+        git.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "fixture",
+            &tree,
+            &[],
+        )
+        .unwrap();
+        git.set_head("refs/heads/main").unwrap();
+
+        // a stub of the two endpoints discovery walks
+        let clone_url = remote.to_string_lossy().into_owned();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        let router = Router::new()
+            .route(
+                "/user/workspaces",
+                get(move || {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async {
+                        axum::Json(serde_json::json!({
+                            "values": [{"workspace": {
+                                "uuid": "{workspace}", "slug": "team", "name": "Team"
+                            }}]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/repositories/{workspace}",
+                get(move || {
+                    let clone_url = clone_url.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "values": [{
+                                "uuid": "{repo}", "slug": "api", "name": "API",
+                                "full_name": "team/api",
+                                "mainbranch": {"name": "main"},
+                                "workspace": {"slug": "team"},
+                                "links": {
+                                    "clone": [{"name": "https", "href": clone_url}],
+                                    "html": {"href": "https://example.invalid/team/api"}
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            api_base: api_base.clone(),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let app = BbsApp::with_token(config.clone(), "stub-token").unwrap();
+        let progress: Progress = Arc::new(|_| {});
+
+        let first = app
+            .search(
+                SearchRequest {
+                    queries: vec!["wanted_symbol".into()],
+                    ..Default::default()
+                },
+                progress.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.results.len(), 1);
+        assert_eq!(first.results[0].path, "service.rs");
+        assert_eq!(first.results[0].repository, "team/api");
+        // an online result is not stale, and links at the commit it scanned
+        assert!(!first.results[0].stale);
+        assert!(!first.offline);
+        assert!(!first.cached);
+        assert!(
+            first.results[0]
+                .web_url
+                .starts_with("https://example.invalid/team/api/src/")
+        );
+        // discovery was written to the catalog cache on the way through
+        assert_eq!(
+            cache::load_catalog(&config).unwrap().repositories[0].full_name,
+            "team/api"
+        );
+
+        // and the second run reuses the stored scan
+        let second = app
+            .search(
+                SearchRequest {
+                    queries: vec!["wanted_symbol".into()],
+                    ..Default::default()
+                },
+                progress,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert!(second.cached);
+        assert_eq!(second.results.len(), 1);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        server.abort();
     }
 
     /// `--max-age` covers discovery as well as the fetches. Without it, an
