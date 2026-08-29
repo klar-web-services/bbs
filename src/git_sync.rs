@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    model::{Repository, Snapshot},
+    model::{Repository, Snapshot, SnapshotMeta},
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 /// The result of preparing one repository for a search. A repository that
@@ -86,15 +87,51 @@ fn mark_used(path: &Path) {
     }
 }
 
+/// The metadata file for a checkout: a sibling, not a child. See
+/// [`SnapshotMeta`] for why it cannot live inside the working tree.
+pub fn meta_path(checkout: &Path) -> PathBuf {
+    checkout.with_extension("meta.json")
+}
+
+pub fn read_meta(checkout: &Path) -> Option<SnapshotMeta> {
+    let bytes = fs::read(meta_path(checkout)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_meta(checkout: &Path, meta: &SnapshotMeta) {
+    // Best effort: the cache still works without it, it is only less legible.
+    if let Ok(bytes) = serde_json::to_vec_pretty(meta) {
+        let _ = fs::write(meta_path(checkout), bytes);
+    }
+}
+
+/// When this snapshot was last fetched. Prefers the metadata file and falls
+/// back to the mtime of `FETCH_HEAD`, so caches written before the metadata
+/// existed still answer the question.
+fn synced_at(checkout: &Path) -> Option<chrono::DateTime<Utc>> {
+    if let Some(meta) = read_meta(checkout) {
+        return Some(meta.synced_at);
+    }
+    fs::metadata(checkout.join(".git/FETCH_HEAD"))
+        .and_then(|metadata| metadata.modified())
+        .map(chrono::DateTime::<Utc>::from)
+        .ok()
+}
+
 fn component_hash(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     hex::encode(&digest[..12])
 }
 
+/// The cache directory holding every branch snapshot of one repository.
+pub fn repository_component(uuid: &str) -> String {
+    component_hash(uuid)
+}
+
 pub fn snapshot_path(config: &Config, repository: &Repository, branch: &str) -> PathBuf {
     config
         .snapshots_dir()
-        .join(component_hash(&repository.uuid))
+        .join(repository_component(&repository.uuid))
         .join(component_hash(branch))
 }
 
@@ -171,10 +208,20 @@ pub fn synchronize(
     repository: &Repository,
     branch: &str,
     token: &str,
+    max_age: Option<Duration>,
 ) -> Result<Sync> {
     validate_branch(branch)?;
     let checkout = snapshot_path(config, repository, branch);
     let _lock = lock_snapshot(&checkout)?;
+    // A snapshot fetched inside the requested window is reused as it stands.
+    // The user has stated what freshness they need, so this is not a stale
+    // result: `synchronized_at` still carries the real age for anyone who
+    // wants to judge for themselves.
+    if let Some(max_age) = max_age
+        && let Some(reused) = reuse_within(&checkout, repository, branch, max_age)
+    {
+        return Ok(Sync::Ready(Box::new(reused)));
+    }
     if !checkout.exists()
         && let Some(unavailable) = clone_snapshot(config, repository, branch, token, &checkout)?
     {
@@ -242,15 +289,50 @@ pub fn synchronize(
     )?;
     repo.set_head_detached(commit)?;
     mark_used(&checkout);
+    let synchronized_at = Utc::now();
+    write_meta(
+        &checkout,
+        &SnapshotMeta {
+            repository: repository.clone(),
+            branch: branch.into(),
+            commit: commit.to_string(),
+            synced_at: synchronized_at,
+        },
+    );
 
     Ok(Sync::Ready(Box::new(Snapshot {
         repository: repository.clone(),
         branch: branch.into(),
         commit: commit.to_string(),
-        synchronized_at: Utc::now(),
+        synchronized_at,
         checkout,
         stale: false,
     })))
+}
+
+/// A snapshot young enough to reuse without contacting the remote.
+fn reuse_within(
+    checkout: &Path,
+    repository: &Repository,
+    branch: &str,
+    max_age: Duration,
+) -> Option<Snapshot> {
+    let synced_at = synced_at(checkout)?;
+    let age = Utc::now().signed_duration_since(synced_at).to_std().ok()?;
+    if age > max_age {
+        return None;
+    }
+    let repo = GitRepository::open(checkout).ok()?;
+    let commit = repo.head().and_then(|head| head.peel_to_commit()).ok()?;
+    mark_used(checkout);
+    Some(Snapshot {
+        repository: repository.clone(),
+        branch: branch.into(),
+        commit: commit.id().to_string(),
+        synchronized_at: synced_at,
+        checkout: checkout.to_path_buf(),
+        stale: false,
+    })
 }
 
 pub fn load_offline(config: &Config, repository: &Repository, branch: &str) -> Result<Sync> {
@@ -273,11 +355,21 @@ pub fn load_offline(config: &Config, repository: &Repository, branch: &str) -> R
             )));
         }
     };
-    let synchronized_at = fs::metadata(checkout.join(".git/FETCH_HEAD"))
-        .and_then(|m| m.modified())
-        .map(chrono::DateTime::<Utc>::from)
-        .unwrap_or_else(|_| Utc::now());
+    let synchronized_at = synced_at(&checkout).unwrap_or_else(Utc::now);
     mark_used(&checkout);
+    // Back-fill metadata for caches written before it existed, so an offline
+    // run is enough to make an old cache self-describing.
+    if read_meta(&checkout).is_none() {
+        write_meta(
+            &checkout,
+            &SnapshotMeta {
+                repository: repository.clone(),
+                branch: branch.into(),
+                commit: commit.clone(),
+                synced_at: synchronized_at,
+            },
+        );
+    }
     Ok(Sync::Ready(Box::new(Snapshot {
         repository: repository.clone(),
         branch: branch.into(),
@@ -343,13 +435,13 @@ mod tests {
             clone_url: remote_path.to_string_lossy().into_owned(),
             web_url: "https://example.invalid/test/fixture".into(),
         };
-        let snapshot = synchronize(&config, &repository, "main", "unused")
+        let snapshot = synchronize(&config, &repository, "main", "unused", None)
             .unwrap()
             .snapshot();
         assert_eq!(snapshot.commit, first.to_string());
         assert!(snapshot.checkout.join("source.rs").exists());
         let second = commit(&remote, "fn second() {}\n");
-        let updated = synchronize(&config, &repository, "main", "unused")
+        let updated = synchronize(&config, &repository, "main", "unused", None)
             .unwrap()
             .snapshot();
         assert_eq!(updated.commit, second.to_string());
@@ -391,7 +483,7 @@ mod tests {
             web_url: "https://example.invalid/test/empty".into(),
         };
         assert!(matches!(
-            synchronize(&config, &repository, "main", "unused").unwrap(),
+            synchronize(&config, &repository, "main", "unused", None).unwrap(),
             Sync::Unavailable(_)
         ));
 
@@ -399,13 +491,118 @@ mod tests {
         commit(&populated, "fn only_on_main() {}\n");
         populated.set_head("refs/heads/main").unwrap();
         assert!(matches!(
-            synchronize(&config, &repository, "main", "unused").unwrap(),
+            synchronize(&config, &repository, "main", "unused", None).unwrap(),
             Sync::Ready(_)
         ));
         assert!(matches!(
-            synchronize(&config, &repository, "release/2.x", "unused").unwrap(),
+            synchronize(&config, &repository, "release/2.x", "unused", None).unwrap(),
             Sync::Unavailable(_)
         ));
+    }
+
+    /// Two SHA-256 prefixes are not something a human can map back to a
+    /// repository, so each snapshot describes itself in a sibling file - never
+    /// one inside the working tree, where the scanner would return it as a
+    /// result and the next checkout would delete it.
+    #[test]
+    fn each_snapshot_records_what_it_is_beside_itself() {
+        let temp = tempdir().unwrap();
+        let remote_path = temp.path().join("remote");
+        let remote = GitRepository::init(&remote_path).unwrap();
+        let first = commit(&remote, "fn first() {}\n");
+        remote.set_head("refs/heads/main").unwrap();
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let repository = Repository {
+            uuid: "{described}".into(),
+            workspace: "test".into(),
+            slug: "described".into(),
+            name: "described".into(),
+            full_name: "test/described".into(),
+            default_branch: Some("main".into()),
+            clone_url: remote_path.to_string_lossy().into_owned(),
+            web_url: "https://example.invalid/test/described".into(),
+        };
+        let snapshot = synchronize(&config, &repository, "main", "unused", None)
+            .unwrap()
+            .snapshot();
+        let meta = read_meta(&snapshot.checkout).expect("a snapshot describes itself");
+        assert_eq!(meta.repository.full_name, "test/described");
+        assert_eq!(meta.branch, "main");
+        assert_eq!(meta.commit, first.to_string());
+        // beside the checkout, not inside it
+        assert!(meta_path(&snapshot.checkout).exists());
+        assert!(!snapshot.checkout.join("snapshot.json").exists());
+        assert_eq!(
+            meta_path(&snapshot.checkout).parent(),
+            snapshot.checkout.parent()
+        );
+
+        // and it moves with the snapshot
+        let second = commit(&remote, "fn second() {}\n");
+        synchronize(&config, &repository, "main", "unused", None).unwrap();
+        let meta = read_meta(&snapshot.checkout).unwrap();
+        assert_eq!(meta.commit, second.to_string());
+        assert!(meta.synced_at >= snapshot.synchronized_at);
+    }
+
+    /// `--max-age` reuses a recent snapshot instead of refetching it, which is
+    /// the case `--offline` served far too bluntly.
+    #[test]
+    fn max_age_reuses_a_recent_snapshot_and_refetches_an_old_one() {
+        let temp = tempdir().unwrap();
+        let remote_path = temp.path().join("remote");
+        let remote = GitRepository::init(&remote_path).unwrap();
+        let first = commit(&remote, "fn first() {}\n");
+        remote.set_head("refs/heads/main").unwrap();
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let repository = Repository {
+            uuid: "{windowed}".into(),
+            workspace: "test".into(),
+            slug: "windowed".into(),
+            name: "windowed".into(),
+            full_name: "test/windowed".into(),
+            default_branch: Some("main".into()),
+            clone_url: remote_path.to_string_lossy().into_owned(),
+            web_url: "https://example.invalid/test/windowed".into(),
+        };
+        synchronize(&config, &repository, "main", "unused", None).unwrap();
+        let second = commit(&remote, "fn second() {}\n");
+
+        // inside the window: the old commit stands, and is not called stale,
+        // because the freshness the user asked for was met
+        let reused = synchronize(
+            &config,
+            &repository,
+            "main",
+            "unused",
+            Some(Duration::from_secs(3600)),
+        )
+        .unwrap()
+        .snapshot();
+        assert_eq!(reused.commit, first.to_string());
+        assert!(!reused.stale);
+
+        // outside it: fetched again
+        let refreshed = synchronize(
+            &config,
+            &repository,
+            "main",
+            "unused",
+            Some(Duration::from_secs(0)),
+        )
+        .unwrap()
+        .snapshot();
+        assert_eq!(refreshed.commit, second.to_string());
     }
 
     /// A snapshot whose `.git` is gone must be re-cloned rather than reported
@@ -433,13 +630,13 @@ mod tests {
             clone_url: remote_path.to_string_lossy().into_owned(),
             web_url: "https://example.invalid/test/damaged".into(),
         };
-        let first = synchronize(&config, &repository, "main", "unused")
+        let first = synchronize(&config, &repository, "main", "unused", None)
             .unwrap()
             .snapshot();
         assert!(first.checkout.join("source.rs").exists());
 
         fs::remove_dir_all(first.checkout.join(".git")).unwrap();
-        let healed = synchronize(&config, &repository, "main", "unused")
+        let healed = synchronize(&config, &repository, "main", "unused", None)
             .unwrap()
             .snapshot();
         assert_eq!(healed.commit, first.commit);

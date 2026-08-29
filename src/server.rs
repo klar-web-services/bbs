@@ -141,7 +141,7 @@ async fn repositories(
     Ok(Json(
         state
             .app
-            .catalog(params.offline)
+            .catalog(params.offline, None)
             .await
             .map_err(ApiError::from)?,
     ))

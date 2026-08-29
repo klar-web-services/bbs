@@ -39,6 +39,24 @@ pub struct Snapshot {
     pub stale: bool,
 }
 
+/// Written beside each snapshot so the cache describes itself.
+///
+/// Snapshots live under two SHA-256 prefixes, which is not something a human
+/// can map back to a repository: diagnosing anything meant recomputing hashes
+/// by hand. It carries the whole `Repository` record so a lost catalog can be
+/// rebuilt exactly, permalink URLs included.
+///
+/// It is a *sibling* of the checkout directory, never a file inside it. Inside
+/// the working tree the scanner would return it as a search result and the
+/// next fetch's `remove_untracked` checkout would delete it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    pub repository: Repository,
+    pub branch: String,
+    pub commit: String,
+    pub synced_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MatchRange {
     pub start: usize,

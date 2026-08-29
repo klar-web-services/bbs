@@ -289,8 +289,9 @@ fn render_matches(
 }
 
 /// Fetching and scanning are very different costs on a large workspace, and
-/// one `elapsed_ms` could not tell them apart. The same numbers are always
-/// present in JSON output; `--stats` is what puts them on a terminal.
+/// one `elapsed_ms` could not tell them apart. `sync` covers repository
+/// discovery as well as the fetches. The same numbers are always present in
+/// JSON output; `--stats` is what puts them on a terminal.
 pub fn stats_block(response: &SearchResponse) -> String {
     let mut scan = format!("{} files", response.files_searched);
     if response.skipped_files.total() > 0 {

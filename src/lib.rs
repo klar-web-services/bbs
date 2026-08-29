@@ -4,6 +4,7 @@ pub mod bitbucket;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod duration;
 pub mod git_sync;
 pub mod model;
 pub mod output;

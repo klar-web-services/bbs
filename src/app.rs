@@ -32,6 +32,9 @@ pub struct SearchRequest {
     /// Require a word boundary either side of every term.
     pub word: bool,
     pub offline: bool,
+    /// Reuse any snapshot fetched within this many seconds instead of
+    /// fetching it again. `None` always fetches.
+    pub max_age_seconds: Option<u64>,
     pub context: Option<usize>,
     pub max_results: Option<usize>,
     pub sort: SortMode,
@@ -52,6 +55,7 @@ impl Default for SearchRequest {
             multiline: false,
             word: false,
             offline: false,
+            max_age_seconds: None,
             context: None,
             max_results: None,
             sort: SortMode::Relevance,
@@ -71,9 +75,37 @@ impl BbsApp {
         Ok(Self { config })
     }
 
-    pub async fn catalog(&self, offline: bool) -> Result<RepositoryCatalog> {
+    /// Discovers the accessible repositories, or reuses a recent discovery.
+    ///
+    /// `max_age` covers the catalog as well as the snapshots: back-to-back
+    /// queries otherwise pay for a full workspace and repository walk of the
+    /// Bitbucket API every time, which on a seventy-repository account is a
+    /// second of latency before any file is looked at.
+    pub async fn catalog(
+        &self,
+        offline: bool,
+        max_age: Option<std::time::Duration>,
+    ) -> Result<RepositoryCatalog> {
+        if let Some(max_age) = max_age
+            && !offline
+            && let Ok(cached) = cache::load_catalog(&self.config)
+            && chrono::Utc::now()
+                .signed_duration_since(cached.discovered_at)
+                .to_std()
+                .is_ok_and(|age| age <= max_age)
+        {
+            return Ok(cached);
+        }
         if offline {
-            return cache::load_catalog(&self.config);
+            // The catalog is a cache. When it is missing or corrupt, the
+            // snapshots on disk describe themselves well enough to rebuild
+            // one, which beats refusing to search a cache that is right there.
+            return match cache::load_catalog(&self.config) {
+                Ok(catalog) => Ok(catalog),
+                Err(error) => {
+                    cache::rebuild_catalog_from_snapshots(&self.config).map_err(|_| error)
+                }
+            };
         }
         let client = BitbucketClient::new(&self.config.api_base, auth::token()?)?;
         let catalog = client.discover().await?;
@@ -111,13 +143,16 @@ impl BbsApp {
             tokio::task::spawn_blocking(move || git_sync::lock_searches(&lock_config))
                 .await
                 .context("search lock task failed")??;
+        // A freshness window, rather than the all-or-nothing choice between
+        // fetching everything and pretending to be offline.
+        let max_age = request.max_age_seconds.map(std::time::Duration::from_secs);
         (progress)(SearchEvent::Progress {
             phase: "discovery".into(),
             message: "Discovering accessible repositories".into(),
             current: 0,
             total: 0,
         });
-        let catalog = self.catalog(request.offline).await?;
+        let catalog = self.catalog(request.offline, max_age).await?;
         let repositories = bitbucket::resolve_repositories(&catalog, &request.repositories)?;
         if repositories.is_empty() {
             bail!("no accessible repositories were found");
@@ -149,7 +184,9 @@ impl BbsApp {
                 let outcome = tokio::task::spawn_blocking({
                     let branch = branch.clone();
                     move || match token {
-                        Some(token) => git_sync::synchronize(&config, &repository, &branch, &token),
+                        Some(token) => {
+                            git_sync::synchronize(&config, &repository, &branch, &token, max_age)
+                        }
                         None => git_sync::load_offline(&config, &repository, &branch),
                     }
                 })
@@ -379,6 +416,55 @@ mod tests {
             .unwrap();
         assert!(second.cached);
         assert_eq!(second.results[0].path, "service.rs");
+    }
+
+    /// `--max-age` covers discovery as well as the fetches. Without it, an
+    /// online repeat query pays for a full workspace and repository walk of
+    /// the Bitbucket API before a single file is looked at.
+    #[tokio::test]
+    async fn a_recent_catalog_is_reused_inside_the_max_age_window() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            // any request that escaped the window would fail against this
+            api_base: "http://127.0.0.1:1/unused".into(),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        cache::save_catalog(
+            &config,
+            &RepositoryCatalog {
+                discovered_at: Utc::now(),
+                workspaces: vec![],
+                repositories: vec![Repository {
+                    uuid: "{repo}".into(),
+                    workspace: "team".into(),
+                    slug: "api".into(),
+                    name: "API".into(),
+                    full_name: "team/api".into(),
+                    default_branch: Some("main".into()),
+                    clone_url: String::new(),
+                    web_url: String::new(),
+                }],
+            },
+        )
+        .unwrap();
+        let app = BbsApp::new(config).unwrap();
+
+        // online, but inside the window: served from the cache, no network
+        let catalog = app
+            .catalog(false, Some(std::time::Duration::from_secs(3600)))
+            .await
+            .unwrap();
+        assert_eq!(catalog.repositories.len(), 1);
+
+        // outside it, the network is contacted -- and here, fails
+        assert!(
+            app.catalog(false, Some(std::time::Duration::from_secs(0)))
+                .await
+                .is_err()
+        );
     }
 
     /// Presentation must not be part of the cache key. Re-running the same

@@ -54,6 +54,11 @@ pub struct Cli {
     #[arg(long)]
     pub offline: bool,
 
+    /// Reuse any snapshot fetched within this window instead of fetching it
+    /// again, e.g. `5m`, `1h30m`, `2d`. Default is to always fetch.
+    #[arg(long, value_name = "DURATION", value_parser = crate::duration::parse_duration_secs)]
+    pub max_age: Option<u64>,
+
     #[arg(short = 'i', long, conflicts_with = "case_sensitive")]
     pub ignore_case: bool,
 
@@ -111,6 +116,7 @@ impl Cli {
                 CaseMode::Smart
             },
             offline: self.offline,
+            max_age_seconds: self.max_age,
             context: self.context,
             max_results: self.max_results,
             sort: self.sort.into(),
@@ -190,9 +196,22 @@ pub struct ServeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CacheCommand {
-    Status,
+    /// Report cache sizes and entry counts.
+    Status {
+        /// List every snapshot with its repository, branch, commit and age.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Trim the cache to the configured budgets.
     Prune,
+    /// Drop cached results, keeping the clones.
     ClearResults,
+    /// Drop every cached snapshot of one repository.
+    Forget {
+        /// Repository slug, workspace/slug name, or UUID.
+        #[arg(value_name = "REPOSITORY")]
+        repository: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

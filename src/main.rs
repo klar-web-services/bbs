@@ -66,7 +66,7 @@ async fn run() -> Result<u8> {
             Ok(0)
         }
         Some(Command::Repos(args)) => {
-            let catalog = app.catalog(args.offline).await?;
+            let catalog = app.catalog(args.offline, None).await?;
             let total = catalog.repositories.len();
             let selected: Vec<_> = match &args.filter {
                 Some(filter) => bitbucket::filter_repositories(&catalog.repositories, filter)
@@ -106,8 +106,8 @@ async fn run() -> Result<u8> {
         Some(Command::Update(args)) => update_command(args.check).await,
         Some(Command::Cache { command }) => {
             match command {
-                CacheCommand::Status => {
-                    let status = cache::status(&config)?;
+                CacheCommand::Status { verbose } => {
+                    let status = cache::status(&config, *verbose)?;
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 }
                 CacheCommand::Prune => {
@@ -125,6 +125,27 @@ async fn run() -> Result<u8> {
                 CacheCommand::ClearResults => {
                     cache::clear_results(&config)?;
                     println!("Cleared the result cache.");
+                }
+                CacheCommand::Forget { repository } => {
+                    // Resolved through the cached catalog, so the same short
+                    // names, patterns and did-you-mean apply here as to
+                    // `--repos`.
+                    let catalog = cache::load_catalog(&config)?;
+                    let selected = bitbucket::resolve_repositories(
+                        &catalog,
+                        std::slice::from_ref(repository),
+                    )?;
+                    let lock_config = config.clone();
+                    let _lock = tokio::task::spawn_blocking(move || {
+                        better_bitbucket_search::git_sync::lock_searches(&lock_config)
+                    })
+                    .await??;
+                    let mut freed = 0;
+                    for repo in &selected {
+                        freed += cache::forget(&config, repo)?;
+                        println!("Forgot cached snapshots for {}.", repo.full_name);
+                    }
+                    println!("Reclaimed {freed} bytes.");
                 }
             }
             Ok(0)

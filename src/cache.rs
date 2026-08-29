@@ -1,10 +1,12 @@
 use crate::{
     config::Config,
-    model::{RepositoryCatalog, Snapshot},
+    git_sync,
+    model::{Repository, RepositoryCatalog, Snapshot},
     query::QueryFingerprint,
     search::{CachedScan, ScanOptions},
 };
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -116,11 +118,39 @@ pub fn load_catalog(config: &Config) -> Result<RepositoryCatalog> {
     let path = config.catalog_path();
     let bytes = fs::read(&path).with_context(|| {
         format!(
-            "no cached repository catalog at {}; run an online search first",
+            "no cached repository catalog at {}; run `bbs repos` online to build it",
             path.display()
         )
     })?;
-    serde_json::from_slice(&bytes).context("cached repository catalog is corrupt")
+    // The catalog is derived data: an online run rebuilds it silently, so the
+    // message has to say so rather than reading like a corrupt database.
+    serde_json::from_slice(&bytes)
+        .context("cached repository catalog is corrupt; run `bbs repos` online to rebuild it")
+}
+
+/// Reconstructs a catalog from the snapshots on disk.
+///
+/// A corrupt or missing catalog used to make `--offline` fail outright, even
+/// though every repository it would have named was sitting in the cache with
+/// its own metadata beside it.
+pub fn rebuild_catalog_from_snapshots(config: &Config) -> Result<RepositoryCatalog> {
+    let mut repositories: Vec<Repository> = snapshot_entries(config)?
+        .iter()
+        .filter_map(|entry| git_sync::read_meta(&entry.path))
+        .map(|meta| meta.repository)
+        .collect();
+    repositories.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    repositories.dedup_by(|a, b| a.uuid == b.uuid);
+    if repositories.is_empty() {
+        anyhow::bail!(
+            "no repository catalog and no described snapshots to rebuild one from; run `bbs repos` online"
+        );
+    }
+    Ok(RepositoryCatalog {
+        discovered_at: Utc::now(),
+        workspaces: vec![],
+        repositories,
+    })
 }
 
 pub fn save_catalog(config: &Config, catalog: &RepositoryCatalog) -> Result<()> {
@@ -144,18 +174,74 @@ pub struct CacheStatus {
     pub result_bytes: u64,
     pub snapshots: usize,
     pub result_entries: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Vec<SnapshotDetail>>,
 }
 
-pub fn status(config: &Config) -> Result<CacheStatus> {
+/// One snapshot, described. A snapshot with no metadata yet is listed with
+/// what can still be read from it rather than omitted, because an unidentified
+/// directory taking up disk is exactly what a user needs to see.
+#[derive(Debug, serde::Serialize)]
+pub struct SnapshotDetail {
+    pub repository: Option<String>,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+    pub synced_at: Option<DateTime<Utc>>,
+    pub age_seconds: Option<i64>,
+    pub bytes: u64,
+    pub path: String,
+}
+
+pub fn status(config: &Config, verbose: bool) -> Result<CacheStatus> {
     let (snapshot_bytes, _) = tree_stats(&config.snapshots_dir())?;
-    let snapshots = snapshot_entries(config)?.len();
+    let entries = snapshot_entries(config)?;
     let (result_bytes, result_entries) = tree_stats(&config.results_dir())?;
+    let details = verbose.then(|| {
+        let now = Utc::now();
+        entries
+            .iter()
+            .map(|entry| {
+                let meta = git_sync::read_meta(&entry.path);
+                SnapshotDetail {
+                    repository: meta.as_ref().map(|m| m.repository.full_name.clone()),
+                    branch: meta.as_ref().map(|m| m.branch.clone()),
+                    commit: meta.as_ref().map(|m| m.commit.clone()),
+                    synced_at: meta.as_ref().map(|m| m.synced_at),
+                    age_seconds: meta
+                        .as_ref()
+                        .map(|m| now.signed_duration_since(m.synced_at).num_seconds()),
+                    bytes: entry.size,
+                    path: entry.path.display().to_string(),
+                }
+            })
+            .collect()
+    });
     Ok(CacheStatus {
         snapshot_bytes,
         result_bytes,
-        snapshots,
+        snapshots: entries.len(),
         result_entries,
+        details,
     })
+}
+
+/// Drops every snapshot of one repository, on every branch.
+///
+/// Clearing the whole cache to recover from one bad snapshot meant refetching
+/// everything; the alternative was finding a directory named by two opaque
+/// hashes. Result entries are keyed on commit SHAs and can never be served for
+/// a repository with no snapshot, so they are left to the ordinary budget.
+pub fn forget(config: &Config, repository: &Repository) -> Result<u64> {
+    let root = config
+        .snapshots_dir()
+        .join(git_sync::repository_component(&repository.uuid));
+    if !root.exists() {
+        return Ok(0);
+    }
+    config.validate_cache_target(&root)?;
+    let (bytes, _) = tree_stats(&root)?;
+    fs::remove_dir_all(&root)?;
+    Ok(bytes)
 }
 
 fn tree_stats(root: &Path) -> Result<(u64, usize)> {
@@ -235,9 +321,13 @@ pub fn prune_snapshots(config: &Config) -> Result<u64> {
         }
         config.validate_cache_target(&entry.path)?;
         fs::remove_dir_all(&entry.path)?;
-        let marker = entry.path.with_extension("used");
-        if marker.exists() {
-            let _ = fs::remove_file(marker);
+        for marker in [
+            entry.path.with_extension("used"),
+            git_sync::meta_path(&entry.path),
+        ] {
+            if marker.exists() {
+                let _ = fs::remove_file(marker);
+            }
         }
         current = current.saturating_sub(entry.size);
         removed += entry.size;
@@ -340,6 +430,147 @@ mod tests {
             result_key(&query, &scan, &[snapshot("one")]).unwrap(),
             result_key(&query, &widened, &[snapshot("one")]).unwrap()
         );
+    }
+
+    /// The catalog is derived data. Refusing to search offline because it is
+    /// corrupt, while the snapshots it would have named sit in the cache
+    /// describing themselves, is a refusal with a way out that was not taken.
+    #[test]
+    fn a_corrupt_catalog_is_rebuilt_from_the_snapshots_on_disk() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let repository = Repository {
+            uuid: "{rebuilt}".into(),
+            workspace: "team".into(),
+            slug: "api".into(),
+            name: "API".into(),
+            full_name: "team/api".into(),
+            default_branch: Some("main".into()),
+            clone_url: String::new(),
+            web_url: "https://example.invalid/team/api".into(),
+        };
+
+        // no snapshots at all: the error must still point at the way out
+        let error = rebuild_catalog_from_snapshots(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bbs repos"), "{error}");
+
+        // a described snapshot is enough to rebuild from
+        let checkout = git_sync::snapshot_path(&config, &repository, "main");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        fs::write(
+            git_sync::meta_path(&checkout),
+            serde_json::to_vec(&crate::model::SnapshotMeta {
+                repository: repository.clone(),
+                branch: "main".into(),
+                commit: "0a1b2c3d".into(),
+                synced_at: Utc::now(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let rebuilt = rebuild_catalog_from_snapshots(&config).unwrap();
+        assert_eq!(rebuilt.repositories.len(), 1);
+        // the web URL survives, so permalinks still work
+        assert_eq!(
+            rebuilt.repositories[0].web_url,
+            "https://example.invalid/team/api"
+        );
+
+        // and the corruption message names the fix
+        fs::write(config.catalog_path(), b"{not json").unwrap();
+        let error = load_catalog(&config).unwrap_err().to_string();
+        assert!(
+            error.contains("run `bbs repos` online to rebuild it"),
+            "{error}"
+        );
+    }
+
+    /// Recovering from one bad snapshot used to mean clearing the whole cache
+    /// and refetching everything.
+    #[test]
+    fn forget_drops_one_repository_and_leaves_the_rest() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let make = |uuid: &str, slug: &str| Repository {
+            uuid: uuid.into(),
+            workspace: "team".into(),
+            slug: slug.into(),
+            name: slug.into(),
+            full_name: format!("team/{slug}"),
+            default_branch: Some("main".into()),
+            clone_url: String::new(),
+            web_url: String::new(),
+        };
+        let doomed = make("{doomed}", "doomed");
+        let kept = make("{kept}", "kept");
+        for (repository, branch) in [(&doomed, "main"), (&doomed, "release"), (&kept, "main")] {
+            let checkout = git_sync::snapshot_path(&config, repository, branch);
+            fs::create_dir_all(checkout.join(".git")).unwrap();
+            fs::write(checkout.join("file.txt"), "x".repeat(64)).unwrap();
+        }
+
+        let freed = forget(&config, &doomed).unwrap();
+        assert!(freed >= 128, "both branches should be reclaimed: {freed}");
+        assert!(!git_sync::snapshot_path(&config, &doomed, "main").exists());
+        assert!(!git_sync::snapshot_path(&config, &doomed, "release").exists());
+        assert!(git_sync::snapshot_path(&config, &kept, "main").exists());
+
+        // forgetting something never cached is not an error
+        assert_eq!(forget(&config, &make("{absent}", "absent")).unwrap(), 0);
+    }
+
+    #[test]
+    fn verbose_status_identifies_each_snapshot() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let repository = Repository {
+            uuid: "{listed}".into(),
+            workspace: "team".into(),
+            slug: "api".into(),
+            name: "API".into(),
+            full_name: "team/api".into(),
+            default_branch: Some("main".into()),
+            clone_url: String::new(),
+            web_url: String::new(),
+        };
+        let checkout = git_sync::snapshot_path(&config, &repository, "main");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        fs::write(
+            git_sync::meta_path(&checkout),
+            serde_json::to_vec(&crate::model::SnapshotMeta {
+                repository: repository.clone(),
+                branch: "main".into(),
+                commit: "0a1b2c3d".into(),
+                synced_at: Utc::now(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(status(&config, false).unwrap().details.is_none());
+        let details = status(&config, true).unwrap().details.unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].repository.as_deref(), Some("team/api"));
+        assert_eq!(details[0].branch.as_deref(), Some("main"));
+        assert_eq!(details[0].commit.as_deref(), Some("0a1b2c3d"));
+        assert!(details[0].age_seconds.unwrap() >= 0);
     }
 
     #[test]
