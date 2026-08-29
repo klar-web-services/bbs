@@ -515,7 +515,10 @@ fn containing_line(starts: &[usize], offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::Repository, query::CaseMode};
+    use crate::{
+        model::Repository,
+        query::{CaseMode, QueryOptions},
+    };
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -580,8 +583,14 @@ mod tests {
         fs::write(dir.path().join("bare.txt"), "alpha\nbeta").unwrap();
         let snapshot = snapshot_of(dir.path());
         for source in ["/alpha[\\s\\S]*beta/", "/beta\\s/", "/alpha.*/s"] {
-            let query =
-                CompiledQuery::parse(&[source.into()], false, CaseMode::Sensitive, false).unwrap();
+            let query = CompiledQuery::parse(
+                &[source.into()],
+                QueryOptions {
+                    case_mode: CaseMode::Sensitive,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let response = shown(
                 &query,
                 std::slice::from_ref(&snapshot),
@@ -638,8 +647,14 @@ mod tests {
         fs::write(dir.path().join("binary.bin"), b"needle\x00\x01\x02").unwrap();
         fs::write(dir.path().join("latin1.txt"), b"needle \xff\xfe rest").unwrap();
         let snapshot = snapshot_of(dir.path());
-        let query =
-            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let query = CompiledQuery::parse(
+            &["needle".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let response = shown(
             &query,
             std::slice::from_ref(&snapshot),
@@ -673,8 +688,14 @@ mod tests {
         fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
         fs::write(dir.path().join("b.txt"), "needle\n").unwrap();
         let snapshot = snapshot_of(dir.path());
-        let query =
-            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let query = CompiledQuery::parse(
+            &["needle".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let response = shown(
             &query,
             std::slice::from_ref(&snapshot),
@@ -712,8 +733,14 @@ mod tests {
             fs::write(file, text).unwrap();
         }
         let snapshot = snapshot_of(dir.path());
-        let query =
-            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let query = CompiledQuery::parse(
+            &["needle".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let found = |options: ScanOptions| {
             let response = shown(
                 &query,
@@ -794,8 +821,14 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.rs"), "needle\n").unwrap();
         let snapshot = snapshot_of(dir.path());
-        let query =
-            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let query = CompiledQuery::parse(
+            &["needle".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let outcome = scan_with(
             &query,
             std::slice::from_ref(&snapshot),
@@ -830,8 +863,14 @@ mod tests {
             .collect();
         fs::write(dir.path().join("a.txt"), body).unwrap();
         let snapshot = snapshot_of(dir.path());
-        let query =
-            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let query = CompiledQuery::parse(
+            &["needle".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let outcome = scan_with(
             &query,
             std::slice::from_ref(&snapshot),
@@ -891,8 +930,14 @@ mod tests {
             fs::write(dir.path().join(name), "needle\n").unwrap();
         }
         let snapshot = snapshot_of(dir.path());
-        let query =
-            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let query = CompiledQuery::parse(
+            &["needle".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let complete = scan_with(
             &query,
@@ -956,9 +1001,10 @@ mod tests {
         };
         let query = CompiledQuery::parse(
             &["alpha AND beta".into()],
-            false,
-            CaseMode::Sensitive,
-            false,
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
         )
         .unwrap();
         let response = shown(

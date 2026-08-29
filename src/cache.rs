@@ -288,7 +288,6 @@ mod tests {
     use super::*;
     use crate::{
         model::{Repository, SkippedFiles},
-        query::CaseMode,
         search::{Presentation, SortMode},
     };
     use chrono::Utc;
@@ -304,8 +303,7 @@ mod tests {
                 kind: crate::query::AtomKind::Wildcard,
                 flags: String::new(),
             }],
-            case_mode: CaseMode::Smart,
-            multiline: false,
+            options: crate::query::QueryOptions::default(),
         };
         let scan = ScanOptions::default();
         let repository = Repository {

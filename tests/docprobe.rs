@@ -1,7 +1,7 @@
 //! Every query written in docs/usage.md must actually parse. Keep this list in
 //! step with the examples there.
 
-use better_bitbucket_search::query::{CaseMode, CompiledQuery};
+use better_bitbucket_search::query::{CompiledQuery, QueryOptions};
 
 #[test]
 fn documented_queries_parse() {
@@ -23,15 +23,19 @@ fn documented_queries_parse() {
     ];
     let mut bad = Vec::new();
     for (source, raw, multi) in cases {
-        if let Err(error) =
-            CompiledQuery::parse(&[source.to_string()], *raw, CaseMode::Smart, *multi)
-        {
+        if let Err(error) = CompiledQuery::parse(
+            &[source.to_string()],
+            QueryOptions {
+                regex: *raw,
+                multiline: *multi,
+                ..Default::default()
+            },
+        ) {
             bad.push(format!("{source}  ->  {error}"));
         }
     }
     // this one must fail: an unescaped paren is grouping syntax
-    let unescaped =
-        CompiledQuery::parse(&["parse_query(".to_string()], false, CaseMode::Smart, false);
+    let unescaped = CompiledQuery::parse(&["parse_query(".to_string()], QueryOptions::default());
     assert!(unescaped.is_err(), "expected bare `parse_query(` to fail");
 
     assert!(

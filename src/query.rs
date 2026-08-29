@@ -10,6 +10,32 @@ pub enum CaseMode {
     Sensitive,
 }
 
+/// Everything that changes what a query matches. Grouped rather than passed as
+/// four positional flags, three of which are booleans that would be easy to
+/// transpose silently. All of it belongs in the cache key.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct QueryOptions {
+    /// Treat every source as a raw PCRE2 pattern.
+    pub regex: bool,
+    pub case_mode: CaseMode,
+    /// Let wildcards and `.` cross line breaks.
+    pub multiline: bool,
+    /// Require a word boundary either side of every atom.
+    pub word: bool,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            regex: false,
+            case_mode: CaseMode::Smart,
+            multiline: false,
+            word: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AtomKind {
     Wildcard,
@@ -134,17 +160,11 @@ pub struct CompiledQuery {
     pub sources: Vec<String>,
     pub expression: Expr,
     pub atoms: Vec<CompiledAtom>,
-    pub case_mode: CaseMode,
-    pub multiline: bool,
+    pub options: QueryOptions,
 }
 
 impl CompiledQuery {
-    pub fn parse(
-        sources: &[String],
-        raw_regex: bool,
-        case_mode: CaseMode,
-        multiline: bool,
-    ) -> Result<Self> {
+    pub fn parse(sources: &[String], options: QueryOptions) -> Result<Self> {
         if sources.is_empty() {
             bail!("at least one query is required");
         }
@@ -154,7 +174,7 @@ impl CompiledQuery {
             if source.trim().is_empty() {
                 bail!("queries cannot be empty");
             }
-            let expr = if raw_regex {
+            let expr = if options.regex {
                 let id = atoms.len();
                 atoms.push(AtomSpec {
                     source: source.clone(),
@@ -178,14 +198,13 @@ impl CompiledQuery {
         }
         let compiled = atoms
             .into_iter()
-            .map(|spec| compile_atom(spec, case_mode, multiline))
+            .map(|spec| compile_atom(spec, options))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             sources: sources.to_vec(),
             expression,
             atoms: compiled,
-            case_mode,
-            multiline,
+            options,
         })
     }
 
@@ -200,8 +219,7 @@ impl CompiledQuery {
             sources: self.sources.clone(),
             expression: self.expression.clone(),
             atoms: self.atoms.iter().map(|a| a.spec.clone()).collect(),
-            case_mode: self.case_mode,
-            multiline: self.multiline,
+            options: self.options,
         }
     }
 }
@@ -211,31 +229,154 @@ pub struct QueryFingerprint {
     pub sources: Vec<String>,
     pub expression: Expr,
     pub atoms: Vec<AtomSpec>,
-    pub case_mode: CaseMode,
-    #[serde(default)]
-    pub multiline: bool,
+    pub options: QueryOptions,
 }
 
-fn compile_atom(spec: AtomSpec, case_mode: CaseMode, multiline: bool) -> Result<CompiledAtom> {
+fn compile_atom(spec: AtomSpec, options: QueryOptions) -> Result<CompiledAtom> {
     let pattern = match spec.kind {
         AtomKind::Regex => spec.source.clone(),
-        AtomKind::Wildcard => wildcard_pattern(&spec.source, multiline),
+        AtomKind::Wildcard => wildcard_pattern(&spec.source, options.multiline),
     };
-    let sensitive = match case_mode {
-        CaseMode::Sensitive => true,
-        CaseMode::Ignore => false,
-        CaseMode::Smart => spec.source.chars().any(|c| c.is_uppercase()),
+    // `c` forces case-sensitivity for this atom alone, the inverse of `i`.
+    // Under `-i` there was previously no way back for a single term.
+    let sensitive = if spec.flags.contains('c') {
+        true
+    } else if spec.flags.contains('i') {
+        false
+    } else {
+        match options.case_mode {
+            CaseMode::Sensitive => true,
+            CaseMode::Ignore => false,
+            CaseMode::Smart => has_literal_uppercase(&spec),
+        }
     };
-    let regex = RegexBuilder::new()
-        .caseless(!sensitive || spec.flags.contains('i'))
-        .dotall(multiline || spec.flags.contains('s'))
-        .multi_line(spec.flags.contains('m'))
-        .extended(spec.flags.contains('x'))
-        .utf(true)
-        .ucp(true)
-        .build(&pattern)
-        .map_err(|error| anyhow::anyhow!("invalid query `{}`: {error}", spec.source))?;
+    let build = |pattern: &str| {
+        RegexBuilder::new()
+            .caseless(!sensitive)
+            .dotall(options.multiline || spec.flags.contains('s'))
+            .multi_line(spec.flags.contains('m'))
+            .extended(spec.flags.contains('x'))
+            .utf(true)
+            .ucp(true)
+            .build(pattern)
+            .map_err(|error| anyhow::anyhow!("invalid query `{}`: {error}", spec.source))
+    };
+    let base = build(&pattern)?;
+    // A pattern that matches the empty string matches at every byte offset: it
+    // hits the per-file match cap in every file and returns the whole corpus
+    // marked truncated. It is never what anyone meant, and it is expensive.
+    // Tested before any word-boundary wrapping, which would otherwise mask it.
+    if base.is_match(b"").unwrap_or(false) || is_all_wildcards(&spec) {
+        let shown = if spec.source.is_empty() {
+            "an empty pattern".to_string()
+        } else {
+            format!("`{}`", spec.source)
+        };
+        bail!(
+            "{shown} matches at every position rather than searching for anything; add a term, or list files with `--path <glob> --files-with-matches`"
+        );
+    }
+    let regex = if options.word {
+        build(&format!("\\b(?:{pattern})\\b"))?
+    } else {
+        base
+    };
     Ok(CompiledAtom { spec, regex })
+}
+
+/// `*`, `?`, `**` and friends compile to patterns that match at every position
+/// without matching the empty string, so they need naming separately.
+fn is_all_wildcards(spec: &AtomSpec) -> bool {
+    spec.kind == AtomKind::Wildcard
+        && !spec.source.is_empty()
+        && spec.source.chars().all(|ch| ch == '*' || ch == '?')
+}
+
+/// Whether the user typed an uppercase letter, judged on characters that stand
+/// for themselves.
+///
+/// Smart case used to ask this of the raw source text, so regex syntax counted
+/// as evidence of intent: `/todo\D/` was case-*sensitive* because of the `\D`
+/// and therefore found nothing, while `/todo\s/` was insensitive and matched.
+fn has_literal_uppercase(spec: &AtomSpec) -> bool {
+    match spec.kind {
+        // In a wildcard term a backslash means "the next character literally",
+        // so the `D` of `\D` really is an uppercase D and does count.
+        AtomKind::Wildcard => {
+            let mut chars = spec.source.chars();
+            let mut found = false;
+            while let Some(ch) = chars.next() {
+                let literal = if ch == '\\' {
+                    match chars.next() {
+                        Some(next) => next,
+                        None => break,
+                    }
+                } else {
+                    ch
+                };
+                found |= literal.is_uppercase();
+            }
+            found
+        }
+        AtomKind::Regex => regex_has_literal_uppercase(&spec.source),
+    }
+}
+
+fn regex_has_literal_uppercase(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => {
+                let next = chars.get(index + 1).copied();
+                match next {
+                    // `\p{Lu}` and `\P{...}` name a property, not literal text.
+                    Some('p') | Some('P') => {
+                        index += 2;
+                        if chars.get(index) == Some(&'{') {
+                            while index < chars.len() && chars[index] != '}' {
+                                index += 1;
+                            }
+                            index += 1;
+                        }
+                    }
+                    // `\Q...\E` is the one construct where a backslash
+                    // introduces text that really is literal.
+                    Some('Q') => {
+                        index += 2;
+                        while index < chars.len() {
+                            if chars[index] == '\\' && chars.get(index + 1) == Some(&'E') {
+                                index += 2;
+                                break;
+                            }
+                            if chars[index].is_uppercase() {
+                                return true;
+                            }
+                            index += 1;
+                        }
+                    }
+                    // every other escape is syntax: \D, \S, \W, \B, \A, \Z, \K
+                    Some(_) => index += 2,
+                    None => index += 1,
+                }
+            }
+            // `(?i)`, `(?<Name>`, `(?P<Name>`: the prefix is syntax.
+            '(' if chars.get(index + 1) == Some(&'?') => {
+                index += 2;
+                while index < chars.len() && chars[index] != ':' && chars[index] != ')' {
+                    index += 1;
+                }
+                index += 1;
+            }
+            other => {
+                if other.is_uppercase() {
+                    return true;
+                }
+                index += 1;
+            }
+        }
+    }
+    false
 }
 
 fn wildcard_pattern(source: &str, multiline: bool) -> String {
@@ -243,7 +384,14 @@ fn wildcard_pattern(source: &str, multiline: bool) -> String {
     let mut chars = source.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
+            // `\t`, `\n` and `\r` mean the characters they name. They used to
+            // mean literal `t`, `n` and `r`, which is defensible but was
+            // undocumented and surprising. Every other escape keeps its "the
+            // next character literally" meaning, so `\\` is still a backslash.
             '\\' => match chars.next() {
+                Some('t') => output.push_str("\\t"),
+                Some('n') => output.push_str("\\n"),
+                Some('r') => output.push_str("\\r"),
                 Some(next) => push_escaped(&mut output, next),
                 None => output.push_str("\\\\"),
             },
@@ -391,10 +539,10 @@ impl<'a> Lexer<'a> {
         }
         if let Some(unknown) = run
             .chars()
-            .find(|flag| !matches!(flag, 'i' | 'm' | 's' | 'x'))
+            .find(|flag| !matches!(flag, 'i' | 'c' | 'm' | 's' | 'x'))
         {
             bail!(
-                "unknown regex flag `{unknown}` in `/{pattern}/{run}`; supported flags are i (ignore case), s (. matches newlines), m (^ and $ match at line breaks), and x (ignore whitespace)"
+                "unknown regex flag `{unknown}` in `/{pattern}/{run}`; supported flags are i (ignore case), c (force case-sensitive), s (. matches newlines), m (^ and $ match at line breaks), and x (ignore whitespace)"
             );
         }
         Ok(run)
@@ -576,9 +724,10 @@ mod tests {
     fn precedence_is_not_then_and_then_or() {
         let query = CompiledQuery::parse(
             &["foo OR bar AND NOT baz".into()],
-            false,
-            CaseMode::Sensitive,
-            false,
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(query.expression.evaluate(&[true, false, true]));
@@ -587,8 +736,14 @@ mod tests {
     }
     #[test]
     fn wildcard_stays_on_one_line() {
-        let query =
-            CompiledQuery::parse(&["myVar*end".into()], false, CaseMode::Sensitive, false).unwrap();
+        let query = CompiledQuery::parse(
+            &["myVar*end".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             query.atoms[0]
                 .find_all(b"myVar123end\nmyVar\nend")
@@ -603,8 +758,14 @@ mod tests {
         b"  \"valueGenerator\": {\n    \"template\": \"':aggregations/account-summary/'\"\n";
 
     fn matches(source: &str, multiline: bool) -> bool {
-        let query =
-            CompiledQuery::parse(&[source.to_string()], false, CaseMode::Smart, multiline).unwrap();
+        let query = CompiledQuery::parse(
+            &[source.to_string()],
+            QueryOptions {
+                multiline,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let present = query
             .atoms
             .iter()
@@ -625,8 +786,15 @@ mod tests {
 
     #[test]
     fn multiline_wildcards_stop_at_the_nearest_match() {
-        let query =
-            CompiledQuery::parse(&["a*b".into()], false, CaseMode::Sensitive, true).unwrap();
+        let query = CompiledQuery::parse(
+            &["a*b".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                multiline: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let spans = query.atoms[0].find_all(b"a\nb\nb\nb").spans;
         // lazy, so the first match ends at the first b rather than the last
         assert_eq!(spans[0], (0, 3));
@@ -635,18 +803,28 @@ mod tests {
     #[test]
     fn trailing_regex_flags_are_accepted() {
         assert!(matches("/valueGenerator.*account-summary/s", false));
-        let insensitive =
-            CompiledQuery::parse(&["/VALUEGENERATOR/i".into()], false, CaseMode::Smart, false)
-                .unwrap();
+        let insensitive = CompiledQuery::parse(
+            &["/VALUEGENERATOR/i".into()],
+            QueryOptions {
+                case_mode: CaseMode::Smart,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(!insensitive.atoms[0].find_all(TWO_LINES).spans.is_empty());
         assert_eq!(insensitive.atoms[0].spec.flags, "i");
     }
 
     #[test]
     fn a_boolean_keyword_after_a_regex_is_not_read_as_flags() {
-        let query =
-            CompiledQuery::parse(&["/foo/AND bar".into()], false, CaseMode::Sensitive, false)
-                .unwrap();
+        let query = CompiledQuery::parse(
+            &["/foo/AND bar".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(query.atoms.len(), 2);
         assert_eq!(query.atoms[0].spec.flags, "");
     }
@@ -656,8 +834,14 @@ mod tests {
     #[test]
     fn lowercase_boolean_words_are_search_terms_not_operators() {
         for word in ["and", "or", "not", "And", "Or", "Not"] {
-            let query =
-                CompiledQuery::parse(&[word.into()], false, CaseMode::Sensitive, false).unwrap();
+            let query = CompiledQuery::parse(
+                &[word.into()],
+                QueryOptions {
+                    case_mode: CaseMode::Sensitive,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert_eq!(
                 query.atoms.len(),
                 1,
@@ -666,16 +850,28 @@ mod tests {
             assert_eq!(query.atoms[0].spec.source, word);
         }
         for word in ["and", "or", "not"] {
-            let query =
-                CompiledQuery::parse(&[word.into()], false, CaseMode::Sensitive, false).unwrap();
+            let query = CompiledQuery::parse(
+                &[word.into()],
+                QueryOptions {
+                    case_mode: CaseMode::Sensitive,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert!(
                 !query.atoms[0].find_all(b"x and or not y").spans.is_empty(),
                 "{word} should match the word in a file"
             );
         }
-        let hint = CompiledQuery::parse(&["foo and bar".into()], false, CaseMode::Smart, false)
-            .unwrap_err()
-            .to_string();
+        let hint = CompiledQuery::parse(
+            &["foo and bar".into()],
+            QueryOptions {
+                case_mode: CaseMode::Smart,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(hint.contains("operators must be uppercase"), "{hint}");
         assert!(hint.contains("`AND`"), "{hint}");
     }
@@ -688,8 +884,14 @@ mod tests {
         let subject = br"prefix C:\Users\admin suffix";
         // what a user types: two backslashes for one literal backslash
         for source in [r"C:\\Users", r#""C:\\Users""#, r"'C:\\Users'"] {
-            let query =
-                CompiledQuery::parse(&[source.into()], false, CaseMode::Sensitive, false).unwrap();
+            let query = CompiledQuery::parse(
+                &[source.into()],
+                QueryOptions {
+                    case_mode: CaseMode::Sensitive,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert_eq!(
                 query.atoms[0].find_all(subject).spans.len(),
                 1,
@@ -698,8 +900,14 @@ mod tests {
         }
         // an escaped wildcard is still a literal in both forms
         for source in [r"a\*b", r#""a\*b""#] {
-            let query =
-                CompiledQuery::parse(&[source.into()], false, CaseMode::Sensitive, false).unwrap();
+            let query = CompiledQuery::parse(
+                &[source.into()],
+                QueryOptions {
+                    case_mode: CaseMode::Sensitive,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert!(
                 query.atoms[0].find_all(b"axxb").spans.is_empty(),
                 "{source}"
@@ -709,9 +917,10 @@ mod tests {
         // an escaped quote inside a phrase survives
         let query = CompiledQuery::parse(
             &[r#""say \"hi\"""#.into()],
-            false,
-            CaseMode::Sensitive,
-            false,
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(query.atoms[0].find_all(br#"say "hi""#).spans.len(), 1);
@@ -727,9 +936,15 @@ mod tests {
             "foo OR NOT bar",
             "NOT foo AND NOT bar",
         ] {
-            let error = CompiledQuery::parse(&[source.into()], false, CaseMode::Smart, false)
-                .unwrap_err()
-                .to_string();
+            let error = CompiledQuery::parse(
+                &[source.into()],
+                QueryOptions {
+                    case_mode: CaseMode::Smart,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
             assert!(error.contains("nothing to find"), "{source}: {error}");
         }
         for source in [
@@ -738,16 +953,24 @@ mod tests {
             "NOT bar AND foo",
         ] {
             assert!(
-                CompiledQuery::parse(&[source.into()], false, CaseMode::Smart, false).is_ok(),
+                CompiledQuery::parse(
+                    &[source.into()],
+                    QueryOptions {
+                        case_mode: CaseMode::Smart,
+                        ..Default::default()
+                    }
+                )
+                .is_ok(),
                 "{source} should be accepted"
             );
         }
         // multiple positional queries are ORed, so each one needs its own term
         let error = CompiledQuery::parse(
             &["foo".into(), "NOT bar".into()],
-            false,
-            CaseMode::Smart,
-            false,
+            QueryOptions {
+                case_mode: CaseMode::Smart,
+                ..Default::default()
+            },
         )
         .unwrap_err()
         .to_string();
@@ -756,16 +979,28 @@ mod tests {
 
     #[test]
     fn unknown_regex_flags_and_stray_tokens_explain_themselves() {
-        let flag = CompiledQuery::parse(&["/foo/g".into()], false, CaseMode::Smart, false)
-            .unwrap_err()
-            .to_string();
+        let flag = CompiledQuery::parse(
+            &["/foo/g".into()],
+            QueryOptions {
+                case_mode: CaseMode::Smart,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(flag.contains("unknown regex flag `g`"), "{flag}");
         // the message must name the pattern it is complaining about
         assert!(flag.contains("`/foo/g`"), "{flag}");
 
-        let stray = CompiledQuery::parse(&["foo bar".into()], false, CaseMode::Smart, false)
-            .unwrap_err()
-            .to_string();
+        let stray = CompiledQuery::parse(
+            &["foo bar".into()],
+            QueryOptions {
+                case_mode: CaseMode::Smart,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(stray.contains("term `bar`"), "{stray}");
     }
 
@@ -776,18 +1011,30 @@ mod tests {
     fn deep_nesting_is_refused_instead_of_overflowing_the_stack() {
         for depth in [MAX_NESTING + 1, 20_000, 200_000] {
             let source = format!("{}x{}", "(".repeat(depth), ")".repeat(depth));
-            let error = CompiledQuery::parse(&[source], false, CaseMode::Smart, false)
-                .unwrap_err()
-                .to_string();
+            let error = CompiledQuery::parse(
+                &[source],
+                QueryOptions {
+                    case_mode: CaseMode::Smart,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 error.contains("nesting is too deep"),
                 "depth {depth}: {error}"
             );
         }
         let nots = format!("{}x", "NOT ".repeat(50_000));
-        let error = CompiledQuery::parse(&[nots], false, CaseMode::Smart, false)
-            .unwrap_err()
-            .to_string();
+        let error = CompiledQuery::parse(
+            &[nots],
+            QueryOptions {
+                case_mode: CaseMode::Smart,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("nesting is too deep"), "{error}");
 
         // ordinary nesting still parses, and sibling groups do not accumulate
@@ -795,23 +1042,208 @@ mod tests {
             .map(|i| format!("(a{i} OR b{i})"))
             .collect::<Vec<_>>()
             .join(" AND ");
-        assert!(CompiledQuery::parse(&[wide], false, CaseMode::Smart, false).is_ok());
+        assert!(
+            CompiledQuery::parse(
+                &[wide],
+                QueryOptions {
+                    case_mode: CaseMode::Smart,
+                    ..Default::default()
+                }
+            )
+            .is_ok()
+        );
         assert!(
             CompiledQuery::parse(
                 &["((((((((((x))))))))))".into()],
-                false,
-                CaseMode::Smart,
-                false
+                QueryOptions {
+                    case_mode: CaseMode::Smart,
+                    ..Default::default()
+                }
             )
             .is_ok()
         );
     }
 
+    /// Smart case asked whether the raw source text contained an uppercase
+    /// letter, so regex syntax counted as evidence of intent. `/todo\D/` was
+    /// case-sensitive because of the `\D` and found nothing, while `/todo\s/`
+    /// was insensitive and matched the same line.
+    #[test]
+    fn smart_case_reads_literal_characters_and_not_regex_syntax() {
+        // classes, assertions, properties and group prefixes are syntax
+        for pattern in [
+            r"todo\D",
+            r"todo\S",
+            r"todo\W",
+            r"todo\B",
+            r"todo\A",
+            r"todo\Z",
+            r"todo\K",
+            r"todo\s",
+            r"todo\p{Zs}",
+            r"todo\P{Lu}",
+            r"(?i)todo",
+            r"(?i:todo)",
+            r"(?P<x>todo)",
+        ] {
+            assert!(
+                !regex_has_literal_uppercase(pattern),
+                "{pattern} contains no uppercase the user typed"
+            );
+        }
+        // genuine literal uppercase still counts, including inside \Q...\E
+        for pattern in [r"TODO", r"todoX", r"\Qtodo A\E", r"(?i:todo)X", r"\p{Zs}X"] {
+            assert!(
+                regex_has_literal_uppercase(pattern),
+                "{pattern} does contain uppercase the user typed"
+            );
+        }
+
+        // the reported repro, end to end: these two now agree on case
+        let matches = |source: &str, subject: &[u8]| {
+            let query = CompiledQuery::parse(&[source.into()], QueryOptions::default()).unwrap();
+            !query.atoms[0].find_all(subject).spans.is_empty()
+        };
+        assert!(matches(r"/todo\D/", b"TODO!"));
+        assert!(matches(r"/todo\s/", b"TODO "));
+        assert!(!matches("/TODO/", b"todo"));
+
+        // in a wildcard term a backslash means the next character literally,
+        // so the D of `\D` really is an uppercase D and does count
+        assert!(has_literal_uppercase(&AtomSpec {
+            source: r"todo\D".into(),
+            kind: AtomKind::Wildcard,
+            flags: String::new(),
+        }));
+    }
+
+    /// Under `-i` there was no way back to case-sensitivity for a single term.
+    #[test]
+    fn the_c_flag_forces_one_atom_back_to_case_sensitive() {
+        let query = CompiledQuery::parse(
+            &["/Foo/c".into()],
+            QueryOptions {
+                case_mode: CaseMode::Ignore,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(query.atoms[0].find_all(b"Foo foo").spans.len(), 1);
+
+        let unflagged = CompiledQuery::parse(
+            &["/Foo/".into()],
+            QueryOptions {
+                case_mode: CaseMode::Ignore,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(unflagged.atoms[0].find_all(b"Foo foo").spans.len(), 2);
+    }
+
+    /// Identifier searches almost always want a boundary, and reaching for
+    /// `/\bfoo\b/` silently changed case handling too.
+    #[test]
+    fn word_mode_requires_a_boundary_on_both_sides() {
+        let query = CompiledQuery::parse(
+            &["foo".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                word: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(query.atoms[0].find_all(b"foo a foo b").spans.len(), 2);
+        assert!(query.atoms[0].find_all(b"foobar barfoo").spans.is_empty());
+
+        // it applies to regex atoms too
+        let regex = CompiledQuery::parse(
+            &["/fo+/".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                word: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(regex.atoms[0].find_all(b"foo fooo food").spans.len(), 2);
+    }
+
+    /// A pattern that matches everywhere hits the per-file cap in every file
+    /// and returns the whole corpus marked truncated. Never what anyone meant,
+    /// and expensive.
+    #[test]
+    fn patterns_that_match_at_every_position_are_refused() {
+        for source in [r#""""#, "//", "*", "?", "**", "*?", "/a*/", "/x?/"] {
+            let error = CompiledQuery::parse(&[source.into()], QueryOptions::default())
+                .expect_err(&format!("{source} should be refused"))
+                .to_string();
+            assert!(error.contains("every position"), "{source}: {error}");
+        }
+        // patterns that anchor on something real are still fine
+        for source in ["a*", "?a", "/a?b/", "/fo+/"] {
+            assert!(
+                CompiledQuery::parse(&[source.into()], QueryOptions::default()).is_ok(),
+                "{source} should be accepted"
+            );
+        }
+        // and `-w` must not mask the check by wrapping in word boundaries
+        assert!(
+            CompiledQuery::parse(
+                &["*".into()],
+                QueryOptions {
+                    word: true,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    /// `\t` and `\n` used to mean literal `t` and `n`. Defensible, but
+    /// undocumented and surprising in a tool people paste code into.
+    #[test]
+    fn escape_sequences_in_literal_terms_name_the_characters_they_look_like() {
+        let query = CompiledQuery::parse(
+            &[r"a\tb".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(query.atoms[0].find_all(b"a\tb").spans.len(), 1);
+        assert!(query.atoms[0].find_all(b"atb").spans.is_empty());
+
+        // a literal backslash is still `\\`, in bare and quoted terms alike
+        for source in [r"C:\\Users", r#""C:\\Users""#] {
+            let query = CompiledQuery::parse(
+                &[source.into()],
+                QueryOptions {
+                    case_mode: CaseMode::Sensitive,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                query.atoms[0].find_all(br"C:\Users").spans.len(),
+                1,
+                "{source}"
+            );
+        }
+    }
+
     #[test]
     fn regex_atom_preserves_escapes() {
-        let query =
-            CompiledQuery::parse(&[r"/\bfoo\d+\b/".into()], false, CaseMode::Sensitive, false)
-                .unwrap();
+        let query = CompiledQuery::parse(
+            &[r"/\bfoo\d+\b/".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(query.atoms[0].find_all(b"foo42 nofoo").spans.len(), 1);
     }
 }

@@ -5,7 +5,7 @@ use crate::{
     config::Config,
     git_sync,
     model::{RepositoryCatalog, SearchEvent, SearchResponse, SkippedRepository, Snapshot},
-    query::{CaseMode, CompiledQuery},
+    query::{CaseMode, CompiledQuery, QueryOptions},
     search::{self, Presentation, ScanOptions as SearchOptions, SortMode},
 };
 use anyhow::{Context, Result, bail};
@@ -29,6 +29,8 @@ pub struct SearchRequest {
     pub regex: bool,
     pub case_mode: CaseMode,
     pub multiline: bool,
+    /// Require a word boundary either side of every term.
+    pub word: bool,
     pub offline: bool,
     pub context: Option<usize>,
     pub max_results: Option<usize>,
@@ -48,6 +50,7 @@ impl Default for SearchRequest {
             regex: false,
             case_mode: CaseMode::Smart,
             multiline: false,
+            word: false,
             offline: false,
             context: None,
             max_results: None,
@@ -95,9 +98,12 @@ impl BbsApp {
         let started = std::time::Instant::now();
         let query = CompiledQuery::parse(
             &request.queries,
-            request.regex,
-            request.case_mode,
-            request.multiline,
+            QueryOptions {
+                regex: request.regex,
+                case_mode: request.case_mode,
+                multiline: request.multiline,
+                word: request.word,
+            },
         )?;
         let query_sources = query.sources.clone();
         let lock_config = self.config.clone();

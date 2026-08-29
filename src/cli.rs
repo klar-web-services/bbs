@@ -19,6 +19,10 @@ pub struct Cli {
     #[arg(short = 'M', long)]
     pub multiline: bool,
 
+    /// Require a word boundary either side of every term.
+    #[arg(short = 'w', long)]
+    pub word: bool,
+
     /// Repositories as unique slugs, workspace/slug names, or UUIDs.
     #[arg(long, num_args = 1.., value_delimiter = ',')]
     pub repos: Vec<String>,
@@ -81,6 +85,7 @@ impl Cli {
             branch: self.branch.clone(),
             regex: self.regex,
             multiline: self.multiline,
+            word: self.word,
             case_mode: if self.ignore_case {
                 CaseMode::Ignore
             } else if self.case_sensitive {
