@@ -95,28 +95,52 @@ fn render_terminal(response: &SearchResponse, color: bool) -> Result<()> {
             writeln!(stdout, "{}\n", result.web_url)?;
         }
     }
-    let cache = if response.cached { ", cache hit" } else { "" };
-    let skipped = if response.skipped.is_empty() {
-        String::new()
-    } else {
-        format!("; {} skipped", response.skipped.len())
-    };
-    writeln!(
-        stdout,
-        "{} results across {} repositories ({} files, {} ms{}){}{}",
-        response.results.len(),
-        response.repositories_searched,
-        response.files_searched,
-        response.elapsed_ms,
-        cache,
-        if response.truncated {
-            "; truncated"
-        } else {
-            ""
-        },
-        skipped
-    )?;
+    writeln!(stdout, "{}", summary_line(response))?;
     Ok(())
+}
+
+/// The one line that says what happened. It has to carry three things the user
+/// cannot otherwise see: files the scan walked past, results the display
+/// dropped, and repositories that could not contribute at all.
+pub fn summary_line(response: &SearchResponse) -> String {
+    let mut inside = vec![format!("{} files", response.files_searched)];
+    let skipped_files = response.skipped_files;
+    if skipped_files.total() > 0 {
+        inside.push(format!(
+            "{} skipped: {}",
+            skipped_files.total(),
+            skipped_files.reasons().join(", ")
+        ));
+    }
+    inside.push(format!("{} ms", response.elapsed_ms));
+    if response.cached {
+        inside.push("cache hit".into());
+    }
+    let shown = if response.total_results > response.results.len() {
+        format!(
+            "{} of {} results",
+            response.results.len(),
+            response.total_results
+        )
+    } else {
+        format!("{} results", response.results.len())
+    };
+    let mut line = format!(
+        "{shown} across {} repositories ({})",
+        response.repositories_searched,
+        inside.join(", ")
+    );
+    let reasons = response.truncation.reasons();
+    if !reasons.is_empty() {
+        line.push_str(&format!("; stopped early: {}", reasons.join("; ")));
+    }
+    if !response.skipped.is_empty() {
+        line.push_str(&format!(
+            "; {} repositories skipped",
+            response.skipped.len()
+        ));
+    }
+    line
 }
 
 fn syntax_for_result_path<'a>(syntax_set: &'a SyntaxSet, path: &str) -> &'a SyntaxReference {

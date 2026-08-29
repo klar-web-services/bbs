@@ -89,14 +89,18 @@ pub struct CompiledAtom {
     regex: Regex,
 }
 
-/// Matches collected for one atom in one file. `truncated` records that the
-/// scan stopped early, either at the cap or because PCRE2 gave up on a
-/// pathological pattern. Neither case is worth failing an entire search over,
-/// so the matches found so far are reported instead.
+/// Matches collected for one atom in one file. Neither stopping condition is
+/// worth failing an entire search over, so the matches found so far are
+/// reported instead - but they are reported separately, because hitting the
+/// cap is benign and PCRE2 giving up means the results may be wrong.
 #[derive(Debug, Default)]
 pub struct AtomMatches {
     pub spans: Vec<(usize, usize)>,
-    pub truncated: bool,
+    /// Stopped at `MATCH_CAP`.
+    pub capped: bool,
+    /// PCRE2 reported one of its own limits, e.g. backtracking on a
+    /// catastrophic pattern.
+    pub gave_up: bool,
 }
 
 const MATCH_CAP: usize = 20_000;
@@ -109,14 +113,14 @@ impl CompiledAtom {
                 Ok(span) => {
                     found.spans.push((span.start(), span.end()));
                     if found.spans.len() >= MATCH_CAP {
-                        found.truncated = true;
+                        found.capped = true;
                         break;
                     }
                 }
                 // PCRE2 reports its own limits here, e.g. the backtracking
                 // match limit on a catastrophic pattern.
                 Err(_) => {
-                    found.truncated = true;
+                    found.gave_up = true;
                     break;
                 }
             }

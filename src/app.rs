@@ -86,6 +86,7 @@ impl BbsApp {
         progress: Progress,
         cancelled: Arc<AtomicBool>,
     ) -> Result<SearchResponse> {
+        let started = std::time::Instant::now();
         let query = CompiledQuery::parse(
             &request.queries,
             request.regex,
@@ -181,6 +182,9 @@ impl BbsApp {
         }
         skipped.sort_by(|a, b| a.repository.cmp(&b.repository));
         snapshots.sort_by(|a, b| a.repository.full_name.cmp(&b.repository.full_name));
+        // Fetching seventy repositories and scanning them are very different
+        // costs, and one `elapsed_ms` could not tell them apart.
+        let sync_ms = started.elapsed().as_millis();
         let options = SearchOptions {
             paths: request.paths,
             context: request.context.unwrap_or(self.config.context_lines),
@@ -193,6 +197,10 @@ impl BbsApp {
             && let Some(mut response) = cache::load_result(&self.config, &key)?
         {
             response.skipped = skipped;
+            response.offline = request.offline;
+            response.sync_ms = sync_ms;
+            response.scan_ms = 0;
+            response.elapsed_ms = started.elapsed().as_millis();
             // Freshness describes this run, not the run that populated the
             // cache. The cached body is keyed on exact commits so its content
             // is right either way, but an offline hit must not inherit the
@@ -226,6 +234,9 @@ impl BbsApp {
         .response;
         let mut response = response;
         response.skipped = skipped;
+        response.offline = request.offline;
+        response.sync_ms = sync_ms;
+        response.elapsed_ms = started.elapsed().as_millis();
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("search cancelled");
         }
@@ -376,10 +387,8 @@ mod tests {
             }],
             repositories_searched: 1,
             files_searched: 1,
-            elapsed_ms: 0,
             cached: true,
-            truncated: false,
-            skipped: vec![],
+            ..Default::default()
         };
 
         // an offline run reusing a body written online must read as stale

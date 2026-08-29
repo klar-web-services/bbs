@@ -345,9 +345,7 @@ mod tests {
             repositories_searched: 1,
             files_searched: 2,
             elapsed_ms: 3,
-            cached: false,
-            truncated: false,
-            skipped: Vec::new(),
+            ..Default::default()
         };
         save_result(&config, "key", &response).unwrap();
         let loaded = load_result(&config, "key").unwrap().unwrap();

@@ -1,5 +1,7 @@
 use crate::{
-    model::{MatchRange, ResultLine, SearchResponse, SearchResult, Snapshot},
+    model::{
+        MatchRange, ResultLine, SearchResponse, SearchResult, SkippedFiles, Snapshot, Truncation,
+    },
     query::{CompiledQuery, QueryFingerprint},
 };
 use anyhow::{Context, Result};
@@ -12,7 +14,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -58,6 +60,33 @@ pub struct SearchOutcome {
     pub response: SearchResponse,
 }
 
+/// Tallies kept while scanning. Files dropped for size, binary content or
+/// encoding used to leave no trace at all, so a query that skipped the one file
+/// it should have matched looked exactly like a query that found nothing.
+#[derive(Default)]
+struct ScanCounters {
+    too_large: AtomicUsize,
+    binary: AtomicUsize,
+    not_utf8: AtomicUsize,
+    /// Counted once per file, not once per atom.
+    matches_capped_files: AtomicUsize,
+    pattern_gave_up_files: AtomicUsize,
+}
+
+impl ScanCounters {
+    fn bump(counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn skipped_files(&self) -> SkippedFiles {
+        SkippedFiles {
+            too_large: self.too_large.load(Ordering::Relaxed),
+            binary: self.binary.load(Ordering::Relaxed),
+            not_utf8: self.not_utf8.load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub fn run(
     query: &CompiledQuery,
     snapshots: &[Snapshot],
@@ -67,16 +96,21 @@ pub fn run(
     let started = Instant::now();
     let globset = build_globs(&options.paths)?;
     let positive = query.positive_atoms();
-    let candidates = collect_candidates(snapshots, globset.as_ref(), options.max_file_bytes)?;
+    let counters = ScanCounters::default();
+    let candidates = collect_candidates(
+        snapshots,
+        globset.as_ref(),
+        options.max_file_bytes,
+        &counters,
+    )?;
     let files_searched = candidates.len();
-    let capped = AtomicBool::new(false);
     let nested: Vec<Result<Option<SearchResult>>> = candidates
         .par_iter()
         .map(|(snapshot, path)| {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            search_file(query, snapshot, path, options.context, &positive, &capped)
+            search_file(query, snapshot, path, options.context, &positive, &counters)
         })
         .collect();
     let mut results = Vec::new();
@@ -103,17 +137,29 @@ pub fn run(
                 .then_with(|| a.repository.cmp(&b.repository))
         }),
     }
-    let truncated = results.len() > options.max_results || capped.load(Ordering::Relaxed);
+    let total_results = results.len();
+    let truncation = Truncation::new(
+        total_results > options.max_results,
+        counters.matches_capped_files.load(Ordering::Relaxed),
+        counters.pattern_gave_up_files.load(Ordering::Relaxed),
+    );
     results.truncate(options.max_results);
+    let elapsed_ms = started.elapsed().as_millis();
     Ok(SearchOutcome {
         response: SearchResponse {
             query: query.sources.clone(),
             results,
             repositories_searched: snapshots.len(),
             files_searched,
-            elapsed_ms: started.elapsed().as_millis(),
+            elapsed_ms,
             cached: false,
-            truncated,
+            truncated: truncation.any(),
+            truncation,
+            skipped_files: counters.skipped_files(),
+            total_results,
+            offline: false,
+            sync_ms: 0,
+            scan_ms: elapsed_ms,
             skipped: Vec::new(),
         },
     })
@@ -141,6 +187,7 @@ fn collect_candidates<'a>(
     snapshots: &'a [Snapshot],
     globs: Option<&GlobSet>,
     max_bytes: u64,
+    counters: &ScanCounters,
 ) -> Result<Vec<(&'a Snapshot, std::path::PathBuf)>> {
     let mut output = Vec::new();
     for snapshot in snapshots {
@@ -154,6 +201,7 @@ fn collect_candidates<'a>(
                 continue;
             }
             if entry.metadata()?.len() > max_bytes {
+                ScanCounters::bump(&counters.too_large);
                 continue;
             }
             let relative = entry
@@ -176,23 +224,34 @@ fn search_file(
     path: &Path,
     context: usize,
     positive: &BTreeSet<usize>,
-    capped: &AtomicBool,
+    counters: &ScanCounters,
 ) -> Result<Option<SearchResult>> {
     let bytes = fs::read(path)?;
     if bytes.iter().take(8192).any(|byte| *byte == 0) {
+        ScanCounters::bump(&counters.binary);
         return Ok(None);
     }
     let text = match std::str::from_utf8(&bytes) {
         Ok(text) => text,
-        Err(_) => return Ok(None),
+        Err(_) => {
+            ScanCounters::bump(&counters.not_utf8);
+            return Ok(None);
+        }
     };
     let mut matches: Vec<Vec<(usize, usize)>> = Vec::with_capacity(query.atoms.len());
+    let mut capped_here = false;
+    let mut gave_up_here = false;
     for atom in &query.atoms {
         let found = atom.find_all(&bytes);
-        if found.truncated {
-            capped.store(true, Ordering::Relaxed);
-        }
+        capped_here |= found.capped;
+        gave_up_here |= found.gave_up;
         matches.push(found.spans);
+    }
+    if capped_here {
+        ScanCounters::bump(&counters.matches_capped_files);
+    }
+    if gave_up_here {
+        ScanCounters::bump(&counters.pattern_gave_up_files);
     }
     let present = matches
         .iter()
@@ -443,6 +502,75 @@ mod tests {
             "deep/nested/path/file-1_2.3.txt"
         );
         assert!(!encode_path("日本語.txt").contains('日'));
+    }
+
+    /// A file dropped for size, binary content or encoding used to leave no
+    /// trace, so a query that skipped the very file it should have matched was
+    /// indistinguishable from one that found nothing.
+    #[test]
+    fn files_skipped_by_the_scan_are_counted_by_reason() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("wanted.txt"), "needle here\n").unwrap();
+        fs::write(dir.path().join("huge.txt"), "needle ".repeat(4096)).unwrap();
+        fs::write(dir.path().join("binary.bin"), b"needle\x00\x01\x02").unwrap();
+        fs::write(dir.path().join("latin1.txt"), b"needle \xff\xfe rest").unwrap();
+        let snapshot = snapshot_of(dir.path());
+        let query =
+            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let outcome = run(
+            &query,
+            std::slice::from_ref(&snapshot),
+            &SearchOptions {
+                max_file_bytes: 1024,
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.response.results.len(), 1);
+        assert_eq!(outcome.response.results[0].path, "wanted.txt");
+        assert_eq!(
+            outcome.response.skipped_files,
+            crate::model::SkippedFiles {
+                too_large: 1,
+                binary: 1,
+                not_utf8: 1,
+            }
+        );
+        // the candidate count must exclude the oversized file it never opened
+        assert_eq!(outcome.response.files_searched, 3);
+        assert_eq!(outcome.response.total_results, 1);
+    }
+
+    /// The three ways a search can stop short mean different things, and only
+    /// one of them says the results may be wrong.
+    #[test]
+    fn truncation_distinguishes_a_results_cap_from_an_abandoned_pattern() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        fs::write(dir.path().join("b.txt"), "needle\n").unwrap();
+        let snapshot = snapshot_of(dir.path());
+        let query =
+            CompiledQuery::parse(&["needle".into()], false, CaseMode::Sensitive, false).unwrap();
+        let outcome = run(
+            &query,
+            std::slice::from_ref(&snapshot),
+            &SearchOptions {
+                max_results: 1,
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.response.results.len(), 1);
+        assert_eq!(outcome.response.total_results, 2);
+        assert!(outcome.response.truncation.results_capped);
+        assert!(!outcome.response.truncation.matches_capped);
+        assert!(!outcome.response.truncation.pattern_gave_up);
+        // the compatibility boolean still summarises all three
+        assert!(outcome.response.truncated);
     }
 
     #[test]
