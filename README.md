@@ -81,7 +81,7 @@ Quote path patterns so your shell does not expand them locally.
 
 Query rules:
 
-- `NOT` binds before `AND`, which binds before `OR`.
+- `NOT` binds before `AND`, which binds before `OR`. Operators are uppercase only, so `and`/`or`/`not` stay searchable words.
 - Boolean expressions are evaluated at file level.
 - Multiple positional query expressions are ORed and deduplicated.
 - Bare and quoted terms are literal, with `*` and `?` wildcards.
@@ -90,6 +90,8 @@ Query rules:
 - Wildcards stay on one line, and `.` in a regex excludes newlines. `-M`/`--multiline` lets both cross line breaks, matching lazily so a wildcard stops at the nearest hit rather than the last one in the file.
 - To find two things in one file without caring where they sit, prefer `foo AND bar`: Boolean expressions are evaluated per file, so the terms may be lines apart.
 - Matching is smart-case by default; use `-i` or `-s` to override it.
+- A query needs at least one positive term: `NOT x` alone is refused, `foo AND NOT x` is fine.
+- Repositories with no commits, or without the requested branch, are skipped with a warning rather than failing the search.
 - `--path` accepts Git-style `*`, `?`, character classes, and recursive `**` globs.
 - Normal searches synchronize every selected snapshot before scanning. `--offline` explicitly uses the last cached commits.
 

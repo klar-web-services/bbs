@@ -4,7 +4,7 @@ use crate::{
     cache,
     config::Config,
     git_sync,
-    model::{RepositoryCatalog, SearchEvent, SearchResponse, Snapshot},
+    model::{RepositoryCatalog, SearchEvent, SearchResponse, SkippedRepository, Snapshot},
     query::{CaseMode, CompiledQuery},
     search::{self, SearchOptions, SortMode},
 };
@@ -124,24 +124,45 @@ impl BbsApp {
             let token = token.clone();
             let branch_override = branch_override.clone();
             async move {
-                let branch = branch_override
-                    .or(repository.default_branch.clone())
-                    .with_context(|| {
-                        format!("repository {} has no default branch", repository.full_name)
-                    })?;
-                tokio::task::spawn_blocking(move || match token {
-                    Some(token) => git_sync::synchronize(&config, &repository, &branch, &token),
-                    None => git_sync::load_offline(&config, &repository, &branch),
+                let full_name = repository.full_name.clone();
+                let Some(branch) = branch_override.or(repository.default_branch.clone()) else {
+                    return Ok((
+                        full_name,
+                        None,
+                        git_sync::Sync::Unavailable("no default branch".into()),
+                    ));
+                };
+                let outcome = tokio::task::spawn_blocking({
+                    let branch = branch.clone();
+                    move || match token {
+                        Some(token) => git_sync::synchronize(&config, &repository, &branch, &token),
+                        None => git_sync::load_offline(&config, &repository, &branch),
+                    }
                 })
                 .await
-                .context("snapshot task failed")?
+                .context("snapshot task failed")??;
+                anyhow::Ok((full_name, Some(branch), outcome))
             }
         }))
         .buffer_unordered(concurrency);
         tokio::pin!(jobs);
         let mut snapshots: Vec<Snapshot> = Vec::new();
-        while let Some(snapshot) = jobs.next().await {
-            snapshots.push(snapshot?);
+        let mut skipped: Vec<SkippedRepository> = Vec::new();
+        while let Some(outcome) = jobs.next().await {
+            let (full_name, branch, outcome) = outcome?;
+            match outcome {
+                git_sync::Sync::Ready(snapshot) => snapshots.push(*snapshot),
+                git_sync::Sync::Unavailable(reason) => {
+                    (progress_sync)(SearchEvent::Warning {
+                        message: format!("skipped {full_name}: {reason}"),
+                    });
+                    skipped.push(SkippedRepository {
+                        repository: full_name,
+                        branch,
+                        reason,
+                    });
+                }
+            }
             completed += 1;
             (progress_sync)(SearchEvent::Progress {
                 phase: "sync".into(),
@@ -150,6 +171,15 @@ impl BbsApp {
                 total,
             });
         }
+        if snapshots.is_empty() {
+            let detail = skipped
+                .iter()
+                .map(|s| format!("{} ({})", s.repository, s.reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("no repository could be searched: {detail}");
+        }
+        skipped.sort_by(|a, b| a.repository.cmp(&b.repository));
         snapshots.sort_by(|a, b| a.repository.full_name.cmp(&b.repository.full_name));
         let options = SearchOptions {
             paths: request.paths,
@@ -160,8 +190,15 @@ impl BbsApp {
         };
         let key = cache::result_key(&query.normalized(), &options, &snapshots)?;
         if !request.no_cache
-            && let Some(response) = cache::load_result(&self.config, &key)?
+            && let Some(mut response) = cache::load_result(&self.config, &key)?
         {
+            response.skipped = skipped;
+            // Freshness describes this run, not the run that populated the
+            // cache. The cached body is keyed on exact commits so its content
+            // is right either way, but an offline hit must not inherit the
+            // "verified against the remote" label from an earlier online
+            // search, nor the reverse.
+            restamp_freshness(&mut response, &snapshots);
             (progress)(SearchEvent::Done {
                 response: response.clone(),
             });
@@ -187,6 +224,8 @@ impl BbsApp {
         .await
         .context("search task failed")??
         .response;
+        let mut response = response;
+        response.skipped = skipped;
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("search cancelled");
         }
@@ -202,6 +241,25 @@ impl BbsApp {
             response: response.clone(),
         });
         Ok(response)
+    }
+}
+
+/// Re-labels cached results with the freshness of the snapshots actually used
+/// by this search.
+fn restamp_freshness(response: &mut SearchResponse, snapshots: &[Snapshot]) {
+    let freshness: std::collections::HashMap<(&str, &str), bool> = snapshots
+        .iter()
+        .map(|s| {
+            (
+                (s.repository.full_name.as_str(), s.branch.as_str()),
+                s.stale,
+            )
+        })
+        .collect();
+    for result in &mut response.results {
+        if let Some(stale) = freshness.get(&(result.repository.as_str(), result.branch.as_str())) {
+            result.stale = *stale;
+        }
     }
 }
 
@@ -277,5 +335,66 @@ mod tests {
             .unwrap();
         assert!(second.cached);
         assert_eq!(second.results[0].path, "service.rs");
+    }
+
+    /// A cache hit must report the freshness of *this* search. An offline hit
+    /// on an entry written by an online search used to claim the results had
+    /// been verified against the remote, and vice versa.
+    #[test]
+    fn cached_results_are_relabelled_with_this_run_s_freshness() {
+        let repository = Repository {
+            uuid: "{repo}".into(),
+            workspace: "team".into(),
+            slug: "api".into(),
+            name: "API".into(),
+            full_name: "team/api".into(),
+            default_branch: Some("main".into()),
+            clone_url: String::new(),
+            web_url: "https://example.invalid/team/api".into(),
+        };
+        let snapshot = |stale: bool| Snapshot {
+            repository: repository.clone(),
+            branch: "main".into(),
+            commit: "deadbeef".into(),
+            synchronized_at: Utc::now(),
+            checkout: std::path::PathBuf::new(),
+            stale,
+        };
+        let response = |stale: bool| SearchResponse {
+            query: vec!["wanted".into()],
+            results: vec![crate::model::SearchResult {
+                repository: "team/api".into(),
+                repository_name: "API".into(),
+                path: "service.rs".into(),
+                branch: "main".into(),
+                commit: "deadbeef".into(),
+                web_url: String::new(),
+                score: 1.0,
+                match_count: 1,
+                lines: vec![],
+                stale,
+            }],
+            repositories_searched: 1,
+            files_searched: 1,
+            elapsed_ms: 0,
+            cached: true,
+            truncated: false,
+            skipped: vec![],
+        };
+
+        // an offline run reusing a body written online must read as stale
+        let mut cached = response(false);
+        restamp_freshness(&mut cached, &[snapshot(true)]);
+        assert!(cached.results[0].stale);
+
+        // and an online run reusing a body written offline must not
+        let mut cached = response(true);
+        restamp_freshness(&mut cached, &[snapshot(false)]);
+        assert!(!cached.results[0].stale);
+
+        // a repository absent from this run's snapshots is left untouched
+        let mut cached = response(true);
+        restamp_freshness(&mut cached, &[]);
+        assert!(cached.results[0].stale);
     }
 }

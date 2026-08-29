@@ -37,11 +37,32 @@ Use these in scripts: `bbs "TODO" --format json || [ $? -eq 1 ]`.
 | `NOT a` | Absent |
 | `(a OR b) AND c` | Grouping |
 
-`NOT` binds tightest, then `AND`, then `OR`. Operators must be uppercase.
+`NOT` binds tightest, then `AND`, then `OR`. Operators must be uppercase, so `and`, `or` and `not` remain ordinary search terms. A lowercase keyword used as an operator is reported rather than guessed at:
+
+```console
+$ bbs 'foo and bar'
+error: operators must be uppercase; write `AND` instead of `and`
+```
 
 There is no implicit `AND`. `foo bar` is an error; write `foo AND bar`, or `"foo bar"` for a literal phrase.
 
+A query must have something to find. `NOT x` on its own, and `a OR NOT b`, are true for files while pointing at nothing in them, so they are refused instead of reporting no matches:
+
+```console
+$ bbs 'NOT deprecated'
+error: this query has nothing to find: every way of satisfying it is a `NOT` ...
+```
+
+Write `foo AND NOT deprecated` instead.
+
 Parentheses are grouping syntax. To match a literal one, quote the term or escape it: `"parse_query("` or `parse_query\(`.
+
+Backslash escapes the next character, identically in bare and quoted terms. A literal backslash is `\\`:
+
+```sh
+bbs 'C:\\Users'        # both find C:\Users
+bbs '"C:\\Users"'
+```
 
 Regex flags: `i` ignore case, `s` `.` matches newlines, `m` `^` and `$` match at line breaks, `x` ignore whitespace in the pattern.
 
@@ -201,10 +222,11 @@ Cache lives beside it: `~/.cache/better-bitbucket-search/` on Linux.
 
 ## Limits
 
-- Only tracked UTF-8 text files are searched. Binary files, submodule contents, and Git LFS payloads are skipped.
+- Only tracked UTF-8 text files are searched. Binary files, submodule contents, and Git LFS payloads are skipped. A file counts as binary if a NUL byte appears in its first 8 KiB.
 - Files above `max_file_bytes` are skipped.
 - At most 20,000 matches per term per file; beyond that the response is marked truncated.
 - One branch per repository per search. No history search.
+- A repository that cannot contribute is skipped, not fatal: no commits yet, no such branch, or (offline) no cached snapshot. Each one is named on stderr and listed in `skipped` in JSON output. The search fails only when nothing at all could be searched.
 
 ## Recipes
 

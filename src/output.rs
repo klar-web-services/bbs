@@ -96,9 +96,14 @@ fn render_terminal(response: &SearchResponse, color: bool) -> Result<()> {
         }
     }
     let cache = if response.cached { ", cache hit" } else { "" };
+    let skipped = if response.skipped.is_empty() {
+        String::new()
+    } else {
+        format!("; {} skipped", response.skipped.len())
+    };
     writeln!(
         stdout,
-        "{} results across {} repositories ({} files, {} ms{}){}",
+        "{} results across {} repositories ({} files, {} ms{}){}{}",
         response.results.len(),
         response.repositories_searched,
         response.files_searched,
@@ -108,7 +113,8 @@ fn render_terminal(response: &SearchResponse, color: bool) -> Result<()> {
             "; truncated"
         } else {
             ""
-        }
+        },
+        skipped
     )?;
     Ok(())
 }

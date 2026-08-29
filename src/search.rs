@@ -114,6 +114,7 @@ pub fn run(
             elapsed_ms: started.elapsed().as_millis(),
             cached: false,
             truncated,
+            skipped: Vec::new(),
         },
     })
 }
@@ -218,10 +219,17 @@ fn search_file(
             let last_line = containing_line(&line_starts, end.saturating_sub(1));
             for line in first_line..=last_line {
                 let content_start = line_starts[line];
-                let content_end = line_starts.get(line + 1).copied().unwrap_or(bytes.len());
+                // Clamp to the text actually rendered for this line, which is
+                // the line without its terminator. A match that crosses a line
+                // break otherwise reports an end one or two bytes past the end
+                // of `ResultLine::text`, and every consumer that slices by
+                // those offsets is handed an out-of-range index.
+                let content_end = line_text_end(&bytes, &line_starts, line);
+                let range_start = start.max(content_start) - content_start;
+                let range_end = end.min(content_end).saturating_sub(content_start);
                 line_ranges.entry(line).or_default().push(MatchRange {
-                    start: start.max(content_start) - content_start,
-                    end: end.min(content_end) - content_start,
+                    start: range_start,
+                    end: range_end.max(range_start),
                     atom: *atom,
                 });
                 let from = line.saturating_sub(context);
@@ -293,7 +301,7 @@ fn search_file(
         "{}/src/{}/{}#lines-{}",
         snapshot.repository.web_url.trim_end_matches('/'),
         snapshot.commit,
-        relative.replace(' ', "%20"),
+        encode_path(&relative),
         first_line
     );
     Ok(Some(SearchResult {
@@ -308,6 +316,32 @@ fn search_file(
         lines,
         stale: snapshot.stale,
     }))
+}
+
+/// Percent-encodes a repository-relative path for use in a permalink, one
+/// segment at a time so the separators survive. Escaping only spaces left `#`
+/// to start a URL fragment and `%` to be re-decoded, both of which point the
+/// link at a different file - or at no file at all.
+fn encode_path(relative: &str) -> String {
+    relative
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// End offset of the text `ResultLine` will carry for `line`: the line without
+/// its `\n`, and without a preceding `\r` on CRLF input.
+fn line_text_end(bytes: &[u8], starts: &[usize], line: usize) -> usize {
+    let start = starts[line];
+    let mut end = starts.get(line + 1).copied().unwrap_or(bytes.len());
+    if end > start && bytes.get(end - 1) == Some(&b'\n') {
+        end -= 1;
+    }
+    if end > start && bytes.get(end - 1) == Some(&b'\r') {
+        end -= 1;
+    }
+    end
 }
 
 fn line_starts(bytes: &[u8]) -> Vec<usize> {
@@ -332,6 +366,85 @@ mod tests {
     use crate::{model::Repository, query::CaseMode};
     use chrono::Utc;
     use tempfile::tempdir;
+    fn snapshot_of(dir: &Path) -> Snapshot {
+        Snapshot {
+            repository: Repository {
+                uuid: "1".into(),
+                workspace: "w".into(),
+                slug: "r".into(),
+                name: "r".into(),
+                full_name: "w/r".into(),
+                default_branch: Some("main".into()),
+                clone_url: String::new(),
+                web_url: "https://bitbucket.org/w/r".into(),
+            },
+            branch: "main".into(),
+            commit: "abc".into(),
+            synchronized_at: Utc::now(),
+            checkout: dir.into(),
+            stale: false,
+        }
+    }
+
+    /// Every reported range must index inside the line text it belongs to.
+    /// Matches that cross a line break, and matches that touch the `\r` of a
+    /// CRLF pair, used to report an end past the end of that text.
+    #[test]
+    fn ranges_stay_inside_the_line_text_they_belong_to() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("crlf.txt"), "alpha beta\r\ngamma\r\n").unwrap();
+        fs::write(dir.path().join("lf.txt"), "alpha\nbeta\n").unwrap();
+        fs::write(dir.path().join("bare.txt"), "alpha\nbeta").unwrap();
+        let snapshot = snapshot_of(dir.path());
+        for source in ["/alpha[\\s\\S]*beta/", "/beta\\s/", "/alpha.*/s"] {
+            let query =
+                CompiledQuery::parse(&[source.into()], false, CaseMode::Sensitive, false).unwrap();
+            let outcome = run(
+                &query,
+                std::slice::from_ref(&snapshot),
+                &SearchOptions::default(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            for result in &outcome.response.results {
+                for line in &result.lines {
+                    for range in &line.ranges {
+                        assert!(
+                            range.start <= range.end && range.end <= line.text.len(),
+                            "{source} on {} line {}: {}..{} outside 0..{} ({:?})",
+                            result.path,
+                            line.number,
+                            range.start,
+                            range.end,
+                            line.text.len(),
+                            line.text
+                        );
+                        assert!(
+                            line.text.is_char_boundary(range.start)
+                                && line.text.is_char_boundary(range.end),
+                            "{source}: range is not on a character boundary"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A permalink must survive characters that are structural in a URL.
+    #[test]
+    fn permalink_paths_are_percent_encoded_per_segment() {
+        assert_eq!(encode_path("src/main.rs"), "src/main.rs");
+        assert_eq!(encode_path("a dir/a file.txt"), "a%20dir/a%20file.txt");
+        assert_eq!(encode_path("hash#name.txt"), "hash%23name.txt");
+        assert_eq!(encode_path("percent%20name.txt"), "percent%2520name.txt");
+        assert_eq!(encode_path("q?uery.txt"), "q%3Fuery.txt");
+        assert_eq!(
+            encode_path("deep/nested/path/file-1_2.3.txt"),
+            "deep/nested/path/file-1_2.3.txt"
+        );
+        assert!(!encode_path("日本語.txt").contains('日'));
+    }
+
     #[test]
     fn searches_boolean_expression_in_same_file() {
         let dir = tempdir().unwrap();

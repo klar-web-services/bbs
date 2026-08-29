@@ -347,6 +347,7 @@ mod tests {
             elapsed_ms: 3,
             cached: false,
             truncated: false,
+            skipped: Vec::new(),
         };
         save_result(&config, "key", &response).unwrap();
         let loaded = load_result(&config, "key").unwrap().unwrap();

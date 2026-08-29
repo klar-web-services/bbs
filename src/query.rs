@@ -42,6 +42,32 @@ impl Expr {
         }
     }
 
+    /// Whether every way this expression can be satisfied involves at least one
+    /// atom that actually matched something. `NOT x` and `a OR NOT b` can be
+    /// true for a file while pointing at nothing in it, and results are built
+    /// from matched spans, so such a query would silently report no matches at
+    /// all rather than the files it logically selected.
+    fn has_evidence(&self, negated: bool) -> bool {
+        match self {
+            Expr::Atom(_) => !negated,
+            Expr::Not(inner) => inner.has_evidence(!negated),
+            Expr::And(left, right) => {
+                if negated {
+                    left.has_evidence(negated) && right.has_evidence(negated)
+                } else {
+                    left.has_evidence(negated) || right.has_evidence(negated)
+                }
+            }
+            Expr::Or(left, right) => {
+                if negated {
+                    left.has_evidence(negated) || right.has_evidence(negated)
+                } else {
+                    left.has_evidence(negated) && right.has_evidence(negated)
+                }
+            }
+        }
+    }
+
     fn collect_positive(&self, negated: bool, output: &mut BTreeSet<usize>) {
         match self {
             Expr::Atom(id) if !negated => {
@@ -141,6 +167,11 @@ impl CompiledQuery {
             .into_iter()
             .reduce(|a, b| Expr::Or(Box::new(a), Box::new(b)))
             .unwrap();
+        if !expression.has_evidence(false) {
+            bail!(
+                "this query has nothing to find: every way of satisfying it is a `NOT`, so there would be no matches to show. Combine it with a term, for example `foo AND NOT bar`"
+            );
+        }
         let compiled = atoms
             .into_iter()
             .map(|spec| compile_atom(spec, case_mode, multiline))
@@ -289,6 +320,11 @@ impl<'a> Lexer<'a> {
             let ch = self.chars[self.pos];
             self.pos += 1;
             if escaped {
+                // Keep the escape intact: `wildcard_pattern` performs the one
+                // and only unescaping pass. Consuming it here as well made
+                // `"C:\\Users"` mean `C:Users`, and quoted terms need twice as
+                // many backslashes as bare ones to say the same thing.
+                source.push('\\');
                 source.push(ch);
                 escaped = false;
             } else if ch == '\\' {
@@ -324,7 +360,7 @@ impl<'a> Lexer<'a> {
             } else if ch == '\\' {
                 escaped = true;
             } else if ch == '/' {
-                let flags = self.regex_flags()?;
+                let flags = self.regex_flags(&source)?;
                 return Ok(Token::Atom(AtomSpec {
                     source,
                     kind: AtomKind::Regex,
@@ -339,13 +375,13 @@ impl<'a> Lexer<'a> {
 
     /// Reads trailing regex flags after a closing `/`. A following Boolean
     /// keyword is left alone so `/foo/AND bar` still parses.
-    fn regex_flags(&mut self) -> Result<String> {
+    fn regex_flags(&mut self, pattern: &str) -> Result<String> {
         let start = self.pos;
         while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_alphabetic() {
             self.pos += 1;
         }
         let run: String = self.chars[start..self.pos].iter().collect();
-        if matches!(run.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT") {
+        if matches!(run.as_str(), "AND" | "OR" | "NOT") {
             self.pos = start;
             return Ok(String::new());
         }
@@ -354,13 +390,7 @@ impl<'a> Lexer<'a> {
             .find(|flag| !matches!(flag, 'i' | 'm' | 's' | 'x'))
         {
             bail!(
-                "unknown regex flag `{unknown}` in `/{}/{run}`; supported flags are i (ignore case), s (. matches newlines), m (^ and $ match at line breaks), and x (ignore whitespace)",
-                self.chars[..start]
-                    .iter()
-                    .collect::<String>()
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or_default()
+                "unknown regex flag `{unknown}` in `/{pattern}/{run}`; supported flags are i (ignore case), s (. matches newlines), m (^ and $ match at line breaks), and x (ignore whitespace)"
             );
         }
         Ok(run)
@@ -382,7 +412,10 @@ impl<'a> Lexer<'a> {
             }
         }
         let source: String = self.chars[start..self.pos].iter().collect();
-        match source.to_ascii_uppercase().as_str() {
+        // Operators are uppercase only, so `and`, `or` and `not` stay ordinary
+        // searchable words. Lowercase keywords used as operators are caught by
+        // the parser, which suggests the uppercase form.
+        match source.as_str() {
             "AND" => Ok(Token::And),
             "OR" => Ok(Token::Or),
             "NOT" => Ok(Token::Not),
@@ -392,6 +425,23 @@ impl<'a> Lexer<'a> {
                 flags: String::new(),
             })),
         }
+    }
+}
+
+/// A bare word that is a Boolean keyword in the wrong case is almost always a
+/// mistyped operator rather than a search term, so say so.
+fn lowercase_keyword(token: &Token) -> Option<&str> {
+    let Token::Atom(spec) = token else {
+        return None;
+    };
+    if spec.kind != AtomKind::Wildcard {
+        return None;
+    }
+    match spec.source.to_ascii_uppercase().as_str() {
+        "AND" if spec.source != "AND" => Some("AND"),
+        "OR" if spec.source != "OR" => Some("OR"),
+        "NOT" if spec.source != "NOT" => Some("NOT"),
+        _ => None,
     }
 }
 
@@ -410,10 +460,17 @@ fn describe(token: &Token) -> String {
     }
 }
 
+/// Depth cap for the recursive-descent parser. Real queries nest a handful of
+/// levels; without a cap, a query of a few thousand parentheses overflows the
+/// stack and aborts the process. `bbs serve` accepts query bodies up to 1 MiB,
+/// so that abort was reachable from a single local request.
+const MAX_NESTING: usize = 128;
+
 struct Parser<'a, 'b> {
     lexer: Lexer<'a>,
     lookahead: Token,
     atoms: &'b mut Vec<AtomSpec>,
+    depth: usize,
 }
 
 impl<'a, 'b> Parser<'a, 'b> {
@@ -424,7 +481,16 @@ impl<'a, 'b> Parser<'a, 'b> {
             lexer,
             lookahead,
             atoms,
+            depth: 0,
         })
+    }
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        anyhow::ensure!(
+            self.depth <= MAX_NESTING,
+            "query nesting is too deep (limit {MAX_NESTING}); simplify the parentheses or the NOT chain"
+        );
+        Ok(())
     }
     fn bump(&mut self) -> Result<Token> {
         let current = std::mem::replace(&mut self.lookahead, Token::End);
@@ -434,6 +500,15 @@ impl<'a, 'b> Parser<'a, 'b> {
     fn parse(mut self) -> Result<Expr> {
         let expr = self.parse_or()?;
         if self.lookahead != Token::End {
+            if let Some(upper) = lowercase_keyword(&self.lookahead) {
+                bail!(
+                    "operators must be uppercase; write `{upper}` instead of `{}`",
+                    match &self.lookahead {
+                        Token::Atom(spec) => spec.source.as_str(),
+                        _ => upper,
+                    }
+                );
+            }
             bail!(
                 "unexpected {} after the query expression; join terms with AND, OR, or NOT",
                 describe(&self.lookahead)
@@ -460,7 +535,10 @@ impl<'a, 'b> Parser<'a, 'b> {
     fn parse_not(&mut self) -> Result<Expr> {
         if self.lookahead == Token::Not {
             self.bump()?;
-            Ok(Expr::Not(Box::new(self.parse_not()?)))
+            self.enter()?;
+            let inner = self.parse_not()?;
+            self.depth -= 1;
+            Ok(Expr::Not(Box::new(inner)))
         } else {
             self.parse_primary()
         }
@@ -473,7 +551,9 @@ impl<'a, 'b> Parser<'a, 'b> {
                 Ok(Expr::Atom(id))
             }
             Token::Left => {
+                self.enter()?;
                 let expr = self.parse_or()?;
+                self.depth -= 1;
                 if self.bump()? != Token::Right {
                     bail!("missing closing parenthesis");
                 }
@@ -567,17 +647,160 @@ mod tests {
         assert_eq!(query.atoms[0].spec.flags, "");
     }
 
+    /// Operators are uppercase only, as documented, so the three commonest
+    /// Boolean words stay searchable as ordinary terms.
+    #[test]
+    fn lowercase_boolean_words_are_search_terms_not_operators() {
+        for word in ["and", "or", "not", "And", "Or", "Not"] {
+            let query =
+                CompiledQuery::parse(&[word.into()], false, CaseMode::Sensitive, false).unwrap();
+            assert_eq!(
+                query.atoms.len(),
+                1,
+                "{word} should be one atom, not an operator"
+            );
+            assert_eq!(query.atoms[0].spec.source, word);
+        }
+        for word in ["and", "or", "not"] {
+            let query =
+                CompiledQuery::parse(&[word.into()], false, CaseMode::Sensitive, false).unwrap();
+            assert!(
+                !query.atoms[0].find_all(b"x and or not y").spans.is_empty(),
+                "{word} should match the word in a file"
+            );
+        }
+        let hint = CompiledQuery::parse(&["foo and bar".into()], false, CaseMode::Smart, false)
+            .unwrap_err()
+            .to_string();
+        assert!(hint.contains("operators must be uppercase"), "{hint}");
+        assert!(hint.contains("`AND`"), "{hint}");
+    }
+
+    /// A quoted phrase and a bare term must need the same number of
+    /// backslashes: the lexer used to unescape once and `wildcard_pattern`
+    /// again, so `"C:\\Users"` quietly searched for `C:Users`.
+    #[test]
+    fn quoted_and_bare_terms_escape_identically() {
+        let subject = br"prefix C:\Users\admin suffix";
+        // what a user types: two backslashes for one literal backslash
+        for source in [r"C:\\Users", r#""C:\\Users""#, r"'C:\\Users'"] {
+            let query =
+                CompiledQuery::parse(&[source.into()], false, CaseMode::Sensitive, false).unwrap();
+            assert_eq!(
+                query.atoms[0].find_all(subject).spans.len(),
+                1,
+                "{source} should match a literal backslash"
+            );
+        }
+        // an escaped wildcard is still a literal in both forms
+        for source in [r"a\*b", r#""a\*b""#] {
+            let query =
+                CompiledQuery::parse(&[source.into()], false, CaseMode::Sensitive, false).unwrap();
+            assert!(
+                query.atoms[0].find_all(b"axxb").spans.is_empty(),
+                "{source}"
+            );
+            assert_eq!(query.atoms[0].find_all(b"a*b").spans.len(), 1, "{source}");
+        }
+        // an escaped quote inside a phrase survives
+        let query = CompiledQuery::parse(
+            &[r#""say \"hi\"""#.into()],
+            false,
+            CaseMode::Sensitive,
+            false,
+        )
+        .unwrap();
+        assert_eq!(query.atoms[0].find_all(br#"say "hi""#).spans.len(), 1);
+    }
+
+    /// A query whose every satisfying branch is a negation would report zero
+    /// matches for files it logically selected, so it is refused up front.
+    #[test]
+    fn queries_with_nothing_to_find_are_refused() {
+        for source in [
+            "NOT foo",
+            "NOT (foo AND bar)",
+            "foo OR NOT bar",
+            "NOT foo AND NOT bar",
+        ] {
+            let error = CompiledQuery::parse(&[source.into()], false, CaseMode::Smart, false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("nothing to find"), "{source}: {error}");
+        }
+        for source in [
+            "foo AND NOT bar",
+            "(foo OR bar) AND NOT baz",
+            "NOT bar AND foo",
+        ] {
+            assert!(
+                CompiledQuery::parse(&[source.into()], false, CaseMode::Smart, false).is_ok(),
+                "{source} should be accepted"
+            );
+        }
+        // multiple positional queries are ORed, so each one needs its own term
+        let error = CompiledQuery::parse(
+            &["foo".into(), "NOT bar".into()],
+            false,
+            CaseMode::Smart,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("nothing to find"), "{error}");
+    }
+
     #[test]
     fn unknown_regex_flags_and_stray_tokens_explain_themselves() {
         let flag = CompiledQuery::parse(&["/foo/g".into()], false, CaseMode::Smart, false)
             .unwrap_err()
             .to_string();
         assert!(flag.contains("unknown regex flag `g`"), "{flag}");
+        // the message must name the pattern it is complaining about
+        assert!(flag.contains("`/foo/g`"), "{flag}");
 
         let stray = CompiledQuery::parse(&["foo bar".into()], false, CaseMode::Smart, false)
             .unwrap_err()
             .to_string();
         assert!(stray.contains("term `bar`"), "{stray}");
+    }
+
+    /// A pathological query must be refused, not abort the process. `bbs serve`
+    /// accepts bodies up to 1 MiB, so an unbounded recursive parser was a
+    /// remote-ish crash rather than only a silly CLI input.
+    #[test]
+    fn deep_nesting_is_refused_instead_of_overflowing_the_stack() {
+        for depth in [MAX_NESTING + 1, 20_000, 200_000] {
+            let source = format!("{}x{}", "(".repeat(depth), ")".repeat(depth));
+            let error = CompiledQuery::parse(&[source], false, CaseMode::Smart, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("nesting is too deep"),
+                "depth {depth}: {error}"
+            );
+        }
+        let nots = format!("{}x", "NOT ".repeat(50_000));
+        let error = CompiledQuery::parse(&[nots], false, CaseMode::Smart, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nesting is too deep"), "{error}");
+
+        // ordinary nesting still parses, and sibling groups do not accumulate
+        let wide = (0..500)
+            .map(|i| format!("(a{i} OR b{i})"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        assert!(CompiledQuery::parse(&[wide], false, CaseMode::Smart, false).is_ok());
+        assert!(
+            CompiledQuery::parse(
+                &["((((((((((x))))))))))".into()],
+                false,
+                CaseMode::Smart,
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[test]

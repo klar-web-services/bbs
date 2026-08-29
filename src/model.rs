@@ -68,6 +68,17 @@ pub struct SearchResult {
     pub stale: bool,
 }
 
+/// A repository that was asked for but could not contribute to this search:
+/// it has no commits, lacks the requested branch, or has no cached snapshot in
+/// offline mode. It is reported rather than failing the whole search, because
+/// skipping it hides no results that could otherwise have been found.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkippedRepository {
+    pub repository: String,
+    pub branch: Option<String>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub query: Vec<String>,
@@ -77,6 +88,8 @@ pub struct SearchResponse {
     pub elapsed_ms: u128,
     pub cached: bool,
     pub truncated: bool,
+    #[serde(default)]
+    pub skipped: Vec<SkippedRepository>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

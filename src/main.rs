@@ -117,6 +117,10 @@ async fn run() -> Result<u8> {
             let spinner = search_spinner();
             let spinner_for_progress = spinner.clone();
             let progress: Progress = Arc::new(move |event| {
+                if let SearchEvent::Warning { message } = &event {
+                    spinner_for_progress.suspend(|| eprintln!("warning: {message}"));
+                    return;
+                }
                 if let Some(message) = spinner_message(&event) {
                     spinner_for_progress.set_message(message);
                 }
