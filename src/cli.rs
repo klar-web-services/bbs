@@ -164,6 +164,9 @@ pub struct LoginArgs {
 
 #[derive(Debug, Args)]
 pub struct ReposArgs {
+    /// Show only repositories matching this substring, or glob pattern.
+    #[arg(value_name = "FILTER")]
+    pub filter: Option<String>,
     #[arg(long)]
     pub offline: bool,
     #[arg(long)]

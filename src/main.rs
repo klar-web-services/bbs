@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use better_bitbucket_search::{
     app::{BbsApp, Progress},
-    auth, cache,
+    auth, bitbucket, cache,
     cli::{CacheCommand, Cli, Command},
     config::Config,
-    model::SearchEvent,
+    model::{RepositoryCatalog, SearchEvent},
     output, server, update,
 };
 use clap::Parser;
@@ -67,15 +67,34 @@ async fn run() -> Result<u8> {
         }
         Some(Command::Repos(args)) => {
             let catalog = app.catalog(args.offline).await?;
+            let total = catalog.repositories.len();
+            let selected: Vec<_> = match &args.filter {
+                Some(filter) => bitbucket::filter_repositories(&catalog.repositories, filter)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+                None => catalog.repositories.clone(),
+            };
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&catalog)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&RepositoryCatalog {
+                        repositories: selected,
+                        ..catalog
+                    })?
+                );
             } else {
-                for repo in catalog.repositories {
+                for repo in &selected {
                     println!(
                         "{:<48} {}",
                         repo.full_name,
-                        repo.default_branch.unwrap_or_else(|| "<empty>".into())
+                        repo.default_branch.as_deref().unwrap_or("<empty>")
                     );
+                }
+                // Say how much was hidden, so an over-narrow filter is
+                // obvious rather than looking like an empty account.
+                if args.filter.is_some() {
+                    println!("{} of {total} repositories", selected.len());
                 }
             }
             Ok(0)

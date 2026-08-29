@@ -189,15 +189,92 @@ impl BitbucketClient {
     }
 }
 
+/// Whether a requested name is a pattern rather than an exact name.
+fn is_pattern(name: &str) -> bool {
+    name.contains('*') || name.contains('?') || name.contains('[')
+}
+
+fn matches_pattern(repository: &Repository, pattern: &str) -> bool {
+    let glob = match globset::GlobBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+    {
+        Ok(glob) => glob.compile_matcher(),
+        Err(_) => return false,
+    };
+    glob.is_match(&repository.slug) || glob.is_match(&repository.full_name)
+}
+
+/// Edit distance with an early exit, used only to suggest a correction. A
+/// mistyped scope used to be reported with no suggestion even though the whole
+/// catalog was already in memory and the right answer was one edit away.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, ach) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, bch) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ach != bch);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
+/// The closest accessible name to `name`, if one is close enough to be worth
+/// naming. The threshold scales with length so a short slug cannot be
+/// "corrected" to something unrelated.
+pub fn did_you_mean(catalog: &RepositoryCatalog, name: &str) -> Option<String> {
+    let budget = (name.chars().count() / 4).max(2);
+    let lowered = name.to_ascii_lowercase();
+    catalog
+        .repositories
+        .iter()
+        .flat_map(|repository| [&repository.slug, &repository.full_name])
+        .map(|candidate| {
+            (
+                edit_distance(&lowered, &candidate.to_ascii_lowercase()),
+                candidate.clone(),
+            )
+        })
+        .filter(|(distance, _)| *distance <= budget)
+        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.len().cmp(&b.1.len())))
+        .map(|(_, candidate)| candidate)
+}
+
 pub fn resolve_repositories(
     catalog: &RepositoryCatalog,
     requested: &[String],
 ) -> Result<Vec<Repository>> {
+    // An empty entry is a trailing comma, not a repository. Naming it as
+    // inaccessible reported the wrong problem.
+    let requested: Vec<&String> = requested
+        .iter()
+        .filter(|name| !name.trim().is_empty())
+        .collect();
     if requested.is_empty() {
         return Ok(catalog.repositories.clone());
     }
     let mut resolved = Vec::new();
     for name in requested {
+        // A pattern selects breadth on purpose, so the ambiguity check that
+        // protects an exact short name does not apply to it.
+        if is_pattern(name) {
+            let matched: Vec<_> = catalog
+                .repositories
+                .iter()
+                .filter(|repository| matches_pattern(repository, name))
+                .cloned()
+                .collect();
+            if matched.is_empty() {
+                bail!("no repository matches `{name}`");
+            }
+            resolved.extend(matched);
+            continue;
+        }
         let mut matches: Vec<_> = catalog
             .repositories
             .iter()
@@ -209,7 +286,12 @@ pub fn resolve_repositories(
             .cloned()
             .collect();
         if matches.is_empty() {
-            bail!("repository `{name}` is not accessible");
+            match did_you_mean(catalog, name) {
+                Some(suggestion) => {
+                    bail!("repository `{name}` is not accessible; did you mean `{suggestion}`?")
+                }
+                None => bail!("repository `{name}` is not accessible"),
+            }
         }
         if matches.len() > 1 && !name.contains('/') {
             let choices = matches
@@ -224,6 +306,28 @@ pub fn resolve_repositories(
     resolved.sort_by(|a, b| a.full_name.cmp(&b.full_name));
     resolved.dedup_by(|a, b| a.uuid == b.uuid);
     Ok(resolved)
+}
+
+/// Filters a listing. A pattern is matched as a glob, anything else as a
+/// case-insensitive substring, because `bbs repos api` is a search rather than
+/// a lookup and seventy unfiltered lines are not a listing anyone reads.
+pub fn filter_repositories<'a>(
+    repositories: &'a [Repository],
+    filter: &str,
+) -> Vec<&'a Repository> {
+    let lowered = filter.to_ascii_lowercase();
+    repositories
+        .iter()
+        .filter(|repository| {
+            if is_pattern(filter) {
+                matches_pattern(repository, filter)
+            } else {
+                repository.full_name.to_ascii_lowercase().contains(&lowered)
+                    || repository.slug.to_ascii_lowercase().contains(&lowered)
+                    || repository.name.to_ascii_lowercase().contains(&lowered)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -260,6 +364,91 @@ mod tests {
             resolve_repositories(&catalog, &["one/api".into()]).unwrap()[0].workspace,
             "one"
         );
+    }
+
+    /// A mistyped scope has the whole catalog in memory and the right answer
+    /// one edit away, so it should say so.
+    #[test]
+    fn a_mistyped_repository_is_offered_the_closest_name() {
+        let catalog = RepositoryCatalog {
+            discovered_at: Utc::now(),
+            workspaces: vec![],
+            repositories: vec![
+                repo("team", "api-gateway"),
+                repo("team", "edge-router"),
+                repo("team", "edge-proxy"),
+            ],
+        };
+        let error = resolve_repositories(&catalog, &["api-gatewy".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did you mean `api-gateway`"), "{error}");
+
+        // nothing close enough keeps the plain message rather than guessing
+        let error = resolve_repositories(&catalog, &["totally-unrelated".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("did you mean"), "{error}");
+    }
+
+    /// `--repos 'edge-*'` selects breadth on purpose, so the ambiguity check
+    /// that guards a bare short name must not apply to it.
+    #[test]
+    fn a_pattern_selects_every_repository_it_matches() {
+        let catalog = RepositoryCatalog {
+            discovered_at: Utc::now(),
+            workspaces: vec![],
+            repositories: vec![
+                repo("team", "api-gateway"),
+                repo("team", "edge-router"),
+                repo("team", "edge-proxy"),
+            ],
+        };
+        let resolved = resolve_repositories(&catalog, &["edge-*".into()]).unwrap();
+        assert_eq!(
+            resolved.iter().map(|r| r.slug.as_str()).collect::<Vec<_>>(),
+            ["edge-proxy", "edge-router"]
+        );
+        assert!(
+            resolve_repositories(&catalog, &["nothing-*".into()])
+                .unwrap_err()
+                .to_string()
+                .contains("no repository matches")
+        );
+    }
+
+    /// `--repos api,` reported ``repository `` is not accessible``, which
+    /// names the wrong problem.
+    #[test]
+    fn empty_entries_are_ignored_rather_than_reported_as_missing() {
+        let catalog = RepositoryCatalog {
+            discovered_at: Utc::now(),
+            workspaces: vec![],
+            repositories: vec![repo("team", "api"), repo("team", "web")],
+        };
+        let resolved = resolve_repositories(&catalog, &["api".into(), "".into()]).unwrap();
+        assert_eq!(resolved.len(), 1);
+        // all-empty means no scope was really given, which is every repository
+        assert_eq!(
+            resolve_repositories(&catalog, &["".into(), "  ".into()])
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_listing_filter_matches_substrings_and_patterns() {
+        let repositories = vec![
+            repo("team", "api-gateway"),
+            repo("team", "edge-router"),
+            repo("other", "api"),
+        ];
+        assert_eq!(filter_repositories(&repositories, "api").len(), 2);
+        assert_eq!(filter_repositories(&repositories, "EDGE").len(), 1);
+        assert_eq!(filter_repositories(&repositories, "edge-*").len(), 1);
+        assert_eq!(filter_repositories(&repositories, "other/*").len(), 1);
+        assert!(filter_repositories(&repositories, "zzz").is_empty());
     }
 
     #[test]
