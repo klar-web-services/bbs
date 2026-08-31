@@ -148,7 +148,13 @@ pub enum Command {
     Login(LoginArgs),
     /// Remove the saved Bitbucket credential.
     Logout,
-    /// List repositories visible to the authenticated account.
+    /// List what bbs can see.
+    List {
+        #[command(subcommand)]
+        command: ListCommand,
+    },
+    /// List repositories visible to the authenticated account. Shorthand for
+    /// `bbs list repos`.
     Repos(ReposArgs),
     /// Start the local browser interface.
     Serve(ServeArgs),
@@ -168,15 +174,45 @@ pub struct LoginArgs {
     pub token_stdin: bool,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ListCommand {
+    /// List repositories visible to the authenticated account.
+    #[command(alias = "repositories")]
+    Repos(ReposArgs),
+}
+
 #[derive(Debug, Args)]
 pub struct ReposArgs {
-    /// Show only repositories matching this substring, or glob pattern.
-    #[arg(value_name = "FILTER")]
+    /// Positional form of `--filter`.
+    #[arg(value_name = "FILTER", conflicts_with = "filter")]
+    pub positional_filter: Option<String>,
+
+    /// Show only repositories whose slug, workspace/slug, or display name
+    /// matches: a substring, a `*`/`?` glob, or a `/regex/` with the same
+    /// trailing `icsmx` flags a query takes.
+    #[arg(long, value_name = "PATTERN")]
     pub filter: Option<String>,
+
+    /// Read the filter as a raw PCRE2 regular expression, with no surrounding
+    /// slashes.
+    #[arg(short = 'r', long)]
+    pub regex: bool,
+
+    /// List the last discovered catalog without contacting Bitbucket.
     #[arg(long)]
     pub offline: bool,
+
+    /// Print the catalog as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+impl ReposArgs {
+    /// The filter, written either way. Keeping the positional form is what
+    /// lets `bbs repos api` keep working now that `--filter` exists.
+    pub fn pattern(&self) -> Option<&str> {
+        self.filter.as_deref().or(self.positional_filter.as_deref())
+    }
 }
 
 #[derive(Debug, Args)]
@@ -254,6 +290,32 @@ mod tests {
         assert!(matches!(plain.command, Some(Command::Update(ref a)) if !a.check));
         let checking = Cli::try_parse_from(["bbs", "update", "--check"]).unwrap();
         assert!(matches!(checking.command, Some(Command::Update(ref a)) if a.check));
+    }
+
+    #[test]
+    fn repos_takes_its_filter_positionally_or_by_flag() {
+        for argv in [
+            ["bbs", "list", "repos", "edge-*"].as_slice(),
+            ["bbs", "list", "repos", "--filter", "edge-*"].as_slice(),
+            ["bbs", "repos", "edge-*"].as_slice(),
+            ["bbs", "repos", "--filter", "edge-*"].as_slice(),
+        ] {
+            let args = match Cli::try_parse_from(argv).unwrap().command {
+                Some(Command::Repos(args)) => args,
+                Some(Command::List {
+                    command: ListCommand::Repos(args),
+                }) => args,
+                other => panic!("{argv:?} parsed as {other:?}"),
+            };
+            assert_eq!(args.pattern(), Some("edge-*"), "for {argv:?}");
+            assert!(!args.regex, "for {argv:?}");
+        }
+    }
+
+    /// Two spellings of one value would otherwise have to be silently ranked.
+    #[test]
+    fn a_filter_cannot_be_given_both_ways_at_once() {
+        assert!(Cli::try_parse_from(["bbs", "list", "repos", "a", "--filter", "b"]).is_err());
     }
 
     #[test]

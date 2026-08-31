@@ -137,3 +137,66 @@ fn documented_durations_parse() {
     assert_eq!(parse_duration_secs("2d").unwrap(), 172_800);
     assert_eq!(parse_duration_secs("90").unwrap(), 90);
 }
+
+/// The `bbs list repos --filter` forms in docs/usage.md, each one checked
+/// against the repository the doc claims it finds.
+#[test]
+fn documented_repository_filters_select_what_the_docs_say() {
+    use better_bitbucket_search::{bitbucket::RepoFilter, model::Repository};
+
+    let gateway = Repository {
+        uuid: "{gateway}".into(),
+        workspace: "team".into(),
+        slug: "api-gateway".into(),
+        name: "API Gateway".into(),
+        full_name: "team/api-gateway".into(),
+        default_branch: Some("main".into()),
+        clone_url: String::new(),
+        web_url: String::new(),
+    };
+
+    // (filter, --regex, whether it selects team/api-gateway)
+    let cases: &[(&str, bool, bool)] = &[
+        ("api", false, true),
+        ("edge-*", false, false),
+        ("api-?", false, false),
+        ("api-*", false, true),
+        ("[ab]*", false, true),
+        (r"/^team\/(api|web)/", false, true),
+        ("^team/(api|web)", true, true),
+        ("/^api/", false, true),
+        ("/gateway$/i", false, true),
+        // a lone leading slash stays a substring
+        ("/api", false, true),
+        // the display name is a candidate too
+        ("API Gateway", false, true),
+        // case is ignored until `c` says otherwise
+        ("/GATEWAY/", false, true),
+        ("/GATEWAY/c", false, false),
+    ];
+
+    let mut bad = Vec::new();
+    for (source, regex, expected) in cases {
+        match RepoFilter::parse(source, *regex) {
+            Err(error) => bad.push(format!("`{source}` does not parse: {error}")),
+            Ok(filter) if filter.matches(&gateway) != *expected => bad.push(format!(
+                "`{source}` should{} select team/api-gateway",
+                if *expected { "" } else { " not" }
+            )),
+            Ok(_) => {}
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// docs/usage.md promises a filter that cannot be compiled is an error naming
+/// what is wrong, not an empty listing.
+#[test]
+fn a_documented_broken_filter_is_refused() {
+    use better_bitbucket_search::bitbucket::RepoFilter;
+    let error = RepoFilter::parse("api[", false).unwrap_err().to_string();
+    assert!(
+        error.starts_with("invalid filter `api[`: error parsing glob"),
+        "unexpected error: {error}"
+    );
+}

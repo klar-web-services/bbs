@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use better_bitbucket_search::{
     app::{BbsApp, Progress},
     auth, bitbucket, cache,
-    cli::{CacheCommand, Cli, Command},
+    cli::{CacheCommand, Cli, Command, ListCommand},
     config::Config,
     model::{RepositoryCatalog, SearchEvent},
     output, server, update,
@@ -65,10 +65,22 @@ async fn run() -> Result<u8> {
             println!("Removed the saved Bitbucket credential.");
             Ok(0)
         }
-        Some(Command::Repos(args)) => {
+        Some(Command::Repos(args))
+        | Some(Command::List {
+            command: ListCommand::Repos(args),
+        }) => {
+            // Parsed before the catalog is fetched, so a mistyped pattern
+            // costs nothing and is reported straight away.
+            let filter = match args.pattern() {
+                Some(pattern) => Some(bitbucket::RepoFilter::parse(pattern, args.regex)?),
+                None if args.regex => {
+                    bail!("--regex needs a filter to apply to; pass one, or drop --regex")
+                }
+                None => None,
+            };
             let catalog = app.catalog(args.offline, None).await?;
             let total = catalog.repositories.len();
-            let selected: Vec<_> = match &args.filter {
+            let selected: Vec<_> = match &filter {
                 Some(filter) => bitbucket::filter_repositories(&catalog.repositories, filter)
                     .into_iter()
                     .cloned()
@@ -93,7 +105,7 @@ async fn run() -> Result<u8> {
                 }
                 // Say how much was hidden, so an over-narrow filter is
                 // obvious rather than looking like an empty account.
-                if args.filter.is_some() {
+                if filter.is_some() {
                     println!("{} of {total} repositories", selected.len());
                 }
             }

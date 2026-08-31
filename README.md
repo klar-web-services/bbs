@@ -79,6 +79,18 @@ bbs '"exact phrase" AND /class\s+\w+/' --branch release/2.x
 
 Quote path patterns so your shell does not expand them locally.
 
+To find out what you can search over in the first place:
+
+```sh
+bbs list repos                       # every accessible repository
+bbs list repos --filter 'edge-*'     # substring, glob, or /regex/
+bbs list repos -r '^team/(api|web)'  # raw PCRE2, no slashes needed
+```
+
+The filter reads like a query term: a plain substring, a `*`/`?` glob, or a `/regex/` with the
+usual `icsmx` flags. It is matched against each repository's slug, `workspace/slug`, and display
+name. `bbs repos` is shorthand for the same command.
+
 Query rules:
 
 - `NOT` binds before `AND`, which binds before `OR`. Operators are uppercase only, so `and`/`or`/`not` stay searchable words.
@@ -113,7 +125,7 @@ Managed depth-1 snapshots and compressed result entries use platform-standard ca
 bbs cache status
 bbs cache prune
 bbs cache clear-results
-bbs repos --offline
+bbs list repos --offline
 ```
 
 Only tracked UTF-8 text files are searched. Binary files, Git metadata, submodule contents, and hydrated Git LFS payloads are excluded in v1.

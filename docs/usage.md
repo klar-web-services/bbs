@@ -7,7 +7,7 @@
 | `bbs <query>...` | Search |
 | `bbs login` | Save and validate a token |
 | `bbs logout` | Remove the saved token |
-| `bbs repos [filter]` | List accessible repositories |
+| `bbs list repos [filter]` | List accessible repositories (`bbs repos` is shorthand) |
 | `bbs serve` | Start the browser interface |
 | `bbs update` | Upgrade to the latest release |
 | `bbs cache status\|prune\|clear-results\|forget` | Inspect and reclaim cache |
@@ -124,6 +124,51 @@ bbs -w getUser       # matches getUser, not getUserById
 `-w`/`--word` requires a word boundary either side of every term. It applies to regex atoms too,
 and unlike writing `/\bfoo\b/` by hand it does not change how the term is case-matched.
 
+## Listing repositories
+
+```sh
+bbs list repos                              # every accessible repository
+bbs list repos api                          # substring, positionally
+bbs list repos --filter api                 # or by flag; the same thing
+bbs list repos --filter 'edge-*'            # glob
+bbs list repos --filter '/^team\/(api|web)/' # PCRE2 regex
+bbs list repos -r '^team/(api|web)'         # regex without the slashes
+bbs list repos --offline                    # last discovered catalog, no network
+bbs list repos --json                       # the catalog, machine-readable
+```
+
+`bbs repos` is shorthand for `bbs list repos` and takes the same options.
+
+The filter reads in one of three forms, the same three the query language uses, so there is no
+second syntax to learn:
+
+| Filter | Read as | Matches |
+| --- | --- | --- |
+| `api` | substring | anywhere in the name |
+| `edge-*`, `api-?`, `[ab]*` | glob | the whole name |
+| `/^api/`, `/gateway$/i` | PCRE2 regex | anywhere in the name |
+| `-r '^api'` | PCRE2 regex | anywhere in the name |
+
+A regex takes the same trailing flags a query atom does — `i`, `c`, `s`, `m`, `x`. Every form is
+matched against the repository's slug, its `workspace/slug` full name, **and** its display name,
+and every form ignores case unless a regex says `c`. Anchors bind to each of those names
+separately, so `/^api/` still finds `team/api-gateway` by way of its slug.
+
+Only a filter that opens with `/` *and* closes with one is a regex. A leading slash on its own
+stays a substring, so `bbs list repos /api` still lists every repository whose slug starts with
+`api`, in any workspace.
+
+A filter that cannot be compiled is an error naming what is wrong, not an empty listing:
+
+```console
+$ bbs list repos --filter 'api['
+error: invalid filter `api[`: error parsing glob 'api[': unclosed character class; missing ']'
+```
+
+Quote patterns so the shell does not expand them. When a filter is in play the listing ends with
+`N of M repositories`, so an over-narrow pattern looks like a narrow filter rather than an empty
+account.
+
 ## Scoping
 
 ```sh
@@ -238,7 +283,7 @@ Every search syncs the selected snapshots first, then scans.
 bbs "query" --offline       # skip the network, use last cached commits
 bbs "query" --max-age 5m    # reuse anything fetched in the last five minutes
 bbs "query" --no-cache      # rescan even if results are cached
-bbs repos --offline
+bbs list repos --offline
 ```
 
 Offline results are labelled stale and report the cached commit. Results cache on exact commit SHAs, so a fetch invalidates them automatically.

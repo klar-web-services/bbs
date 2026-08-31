@@ -1,5 +1,5 @@
 use crate::model::{Repository, RepositoryCatalog, Workspace};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -308,25 +308,111 @@ pub fn resolve_repositories(
     Ok(resolved)
 }
 
-/// Filters a listing. A pattern is matched as a glob, anything else as a
-/// case-insensitive substring, because `bbs repos api` is a search rather than
-/// a lookup and seventy unfiltered lines are not a listing anyone reads.
+/// A `bbs list repos --filter` pattern, in one of the three forms the query
+/// language already uses, so nobody has to learn a second syntax to narrow a
+/// listing:
+///
+/// - `/re/flags` is a PCRE2 regular expression, searched anywhere in the name;
+/// - anything containing `*`, `?` or `[` is a glob, matched against the whole
+///   name;
+/// - anything else is a plain substring, because `bbs list repos api` is a
+///   search rather than a lookup and seventy unfiltered lines are not a
+///   listing anyone reads.
+///
+/// Every form is case-insensitive by default -- this narrows a list of names,
+/// it does not search code, so smart case would only surprise -- and every
+/// form is tried against the slug, the `workspace/slug` full name, and the
+/// display name.
+#[derive(Debug)]
+pub enum RepoFilter {
+    Substring(String),
+    Glob(Box<globset::GlobMatcher>),
+    Regex(Box<pcre2::bytes::Regex>),
+}
+
+impl RepoFilter {
+    /// Parses `source`. `force_regex` is `--regex`, which reads the whole of
+    /// `source` as a pattern so it needs no surrounding slashes -- exactly as
+    /// `-r` does for a query.
+    pub fn parse(source: &str, force_regex: bool) -> Result<Self> {
+        if force_regex {
+            return Self::regex(source, "");
+        }
+        if let Some((pattern, flags)) = as_regex_literal(source) {
+            return Self::regex(pattern, flags);
+        }
+        if is_pattern(source) {
+            // A malformed glob used to match nothing at all, so a stray `[`
+            // read as an empty account rather than as the typo it was.
+            let glob = globset::GlobBuilder::new(source)
+                .case_insensitive(true)
+                .build()
+                .map_err(|error| anyhow!("invalid filter `{source}`: {error}"))?;
+            return Ok(Self::Glob(Box::new(glob.compile_matcher())));
+        }
+        Ok(Self::Substring(source.to_ascii_lowercase()))
+    }
+
+    fn regex(pattern: &str, flags: &str) -> Result<Self> {
+        if let Some(unknown) = flags
+            .chars()
+            .find(|flag| !matches!(flag, 'i' | 'c' | 'm' | 's' | 'x'))
+        {
+            bail!(
+                "unknown regex flag `{unknown}` in filter `/{pattern}/{flags}`; supported flags are i (ignore case), c (force case-sensitive), s (. matches newlines), m (^ and $ match at line breaks), and x (ignore whitespace)"
+            );
+        }
+        let regex = pcre2::bytes::RegexBuilder::new()
+            // The inverse of the query language's `c`: a listing filter is
+            // insensitive unless it asks not to be.
+            .caseless(!flags.contains('c'))
+            .dotall(flags.contains('s'))
+            .multi_line(flags.contains('m'))
+            .extended(flags.contains('x'))
+            .utf(true)
+            .ucp(true)
+            .build(pattern)
+            .map_err(|error| anyhow!("invalid filter regex `/{pattern}/`: {error}"))?;
+        Ok(Self::Regex(Box::new(regex)))
+    }
+
+    pub fn matches(&self, repository: &Repository) -> bool {
+        let names = [
+            repository.full_name.as_str(),
+            repository.slug.as_str(),
+            repository.name.as_str(),
+        ];
+        names.iter().any(|name| match self {
+            Self::Substring(needle) => name.to_ascii_lowercase().contains(needle),
+            Self::Glob(glob) => glob.is_match(name),
+            Self::Regex(regex) => regex.is_match(name.as_bytes()).unwrap_or(false),
+        })
+    }
+}
+
+/// Splits `/pattern/flags` into its parts, or `None` if `source` is not one.
+///
+/// A leading slash alone is not enough: `full_name` is `workspace/slug`, so
+/// `/api` is a perfectly good substring filter for every repository whose slug
+/// starts with `api`, and reading it as an unterminated regex would refuse a
+/// query that works today.
+fn as_regex_literal(source: &str) -> Option<(&str, &str)> {
+    let body = source.strip_prefix('/')?;
+    let close = body.rfind('/')?;
+    let (pattern, flags) = (&body[..close], &body[close + 1..]);
+    flags
+        .chars()
+        .all(|flag| flag.is_ascii_alphabetic())
+        .then_some((pattern, flags))
+}
+
 pub fn filter_repositories<'a>(
     repositories: &'a [Repository],
-    filter: &str,
+    filter: &RepoFilter,
 ) -> Vec<&'a Repository> {
-    let lowered = filter.to_ascii_lowercase();
     repositories
         .iter()
-        .filter(|repository| {
-            if is_pattern(filter) {
-                matches_pattern(repository, filter)
-            } else {
-                repository.full_name.to_ascii_lowercase().contains(&lowered)
-                    || repository.slug.to_ascii_lowercase().contains(&lowered)
-                    || repository.name.to_ascii_lowercase().contains(&lowered)
-            }
-        })
+        .filter(|repository| filter.matches(repository))
         .collect()
 }
 
@@ -437,18 +523,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_listing_filter_matches_substrings_and_patterns() {
-        let repositories = vec![
+    fn matching(repositories: &[Repository], filter: &str) -> usize {
+        filter_repositories(repositories, &RepoFilter::parse(filter, false).unwrap()).len()
+    }
+
+    fn listing() -> Vec<Repository> {
+        vec![
             repo("team", "api-gateway"),
             repo("team", "edge-router"),
             repo("other", "api"),
-        ];
-        assert_eq!(filter_repositories(&repositories, "api").len(), 2);
-        assert_eq!(filter_repositories(&repositories, "EDGE").len(), 1);
-        assert_eq!(filter_repositories(&repositories, "edge-*").len(), 1);
-        assert_eq!(filter_repositories(&repositories, "other/*").len(), 1);
-        assert!(filter_repositories(&repositories, "zzz").is_empty());
+        ]
+    }
+
+    #[test]
+    fn a_listing_filter_matches_substrings_and_patterns() {
+        let repositories = listing();
+        assert_eq!(matching(&repositories, "api"), 2);
+        assert_eq!(matching(&repositories, "EDGE"), 1);
+        assert_eq!(matching(&repositories, "edge-*"), 1);
+        assert_eq!(matching(&repositories, "other/*"), 1);
+        assert_eq!(matching(&repositories, "zzz"), 0);
+    }
+
+    #[test]
+    fn a_slash_delimited_filter_is_a_regex() {
+        let repositories = listing();
+        assert_eq!(matching(&repositories, "/gateway$|router$/"), 2);
+        assert_eq!(matching(&repositories, r"/^other\//"), 1);
+        // The glob form matches a whole name, the regex form searches within
+        // one: `api` finds both, `api` as a glob would find only `other/api`.
+        assert_eq!(matching(&repositories, "/api/"), 2);
+        assert_eq!(matching(&repositories, "api"), 2);
+        // Anchors bind to each candidate name, and the slug is one of them, so
+        // `^api` still reaches `team/api-gateway`.
+        assert_eq!(matching(&repositories, "/^api/"), 2);
+        assert_eq!(matching(&repositories, "/^team/"), 2);
+    }
+
+    #[test]
+    fn a_regex_filter_ignores_case_until_c_says_otherwise() {
+        let repositories = listing();
+        assert_eq!(matching(&repositories, "/EDGE/"), 1);
+        assert_eq!(matching(&repositories, "/EDGE/c"), 0);
+        assert_eq!(matching(&repositories, "/edge/c"), 1);
+    }
+
+    /// `full_name` is `workspace/slug`, so a leading slash is an ordinary and
+    /// useful substring rather than the start of an unterminated regex.
+    #[test]
+    fn a_lone_leading_slash_stays_a_substring() {
+        let repositories = listing();
+        assert_eq!(matching(&repositories, "/api"), 2);
+        assert_eq!(matching(&repositories, "other/"), 1);
+    }
+
+    #[test]
+    fn regex_mode_reads_the_whole_filter_as_a_pattern() {
+        let repositories = listing();
+        let filter = RepoFilter::parse("^team/.*router$", true).unwrap();
+        assert_eq!(filter_repositories(&repositories, &filter).len(), 1);
+    }
+
+    #[test]
+    fn a_broken_filter_explains_itself_instead_of_matching_nothing() {
+        let unterminated = RepoFilter::parse("/api(/", false).unwrap_err().to_string();
+        assert!(
+            unterminated.contains("invalid filter regex"),
+            "unexpected error: {unterminated}"
+        );
+        let unknown = RepoFilter::parse("/api/z", false).unwrap_err().to_string();
+        assert!(
+            unknown.contains("unknown regex flag `z`"),
+            "unexpected error: {unknown}"
+        );
+        let glob = RepoFilter::parse("api[", false).unwrap_err().to_string();
+        assert!(
+            glob.contains("invalid filter `api[`"),
+            "unexpected error: {glob}"
+        );
     }
 
     #[test]
