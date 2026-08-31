@@ -11,3 +11,4 @@
 *.tmp
 .DS_Store
 /local-docs/
+/CLAUDE.md

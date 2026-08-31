@@ -54,13 +54,32 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    env:
+      COG_VERSION: 7.0.0
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - run: cd dist && sha256sum * > checksums.txt
+      - name: Install cocogitto
+        run: |
+          curl -fsSL "https://github.com/cocogitto/cocogitto/releases/download/${COG_VERSION}/cocogitto-${COG_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local/bin x86_64-unknown-linux-musl/cog
+          cog --version
+      - name: Generate changelog
+        run: |
+          cog changelog --at "${GITHUB_REF_NAME}" --template .github/changelog.tera > notes.md
+          if [ ! -s notes.md ] || ! grep -q '[^[:space:]]' notes.md; then
+            echo "No changelog-worthy commits since the previous tag." > notes.md
+          fi
+          echo "--- release notes ---"
+          cat notes.md
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: notes.md
           generate_release_notes: true

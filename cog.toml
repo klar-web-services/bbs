@@ -1,0 +1,23 @@
+# Conventional Commits enforcement and changelog generation for bbs.
+# Install the commit-msg hook after a fresh clone with:  cog install-hook --all
+# The release workflow renders the changelog with .github/changelog.tera.
+
+tag_prefix = "v"
+
+[git_hooks.commit-msg]
+script = """#!/bin/sh
+set -e
+cog verify --file "$1"
+"""
+
+[changelog]
+remote = "github.com"
+owner = "klar-web-services"
+repository = "bbs"
+
+# Housekeeping types stay out of the release notes.
+[commit_types]
+test = { changelog_title = "Tests", omit_from_changelog = true }
+build = { changelog_title = "Build system", omit_from_changelog = true }
+ci = { changelog_title = "Continuous Integration", omit_from_changelog = true }
+chore = { changelog_title = "Miscellaneous Chores", omit_from_changelog = true }

@@ -1,0 +1,17 @@
+{%- set breaking = commits | filter(attribute="breaking_change", value=true) -%}
+{%- if breaking | length > 0 -%}
+### ⚠️ Breaking changes
+{% for commit in breaking %}
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.summary }} ([{{ commit.id | truncate(length=7, end="") }}]({{ repository_url }}/commit/{{ commit.id }}))
+{%- for footer in commit.footers %}{% if footer.footer and footer.footer.token == "BREAKING CHANGE" %}
+  {{ footer.footer.content | replace(from="
+", to=" ") }}
+{%- endif %}{% endfor %}
+{%- endfor %}
+{% endif -%}
+{% for group in commits | group_by_type %}
+### {{ group.0 }}
+{% for commit in group.1 %}
+- {% if commit.breaking_change %}⚠️ {% endif %}{% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.summary }} ([{{ commit.id | truncate(length=7, end="") }}]({{ repository_url }}/commit/{{ commit.id }}))
+{%- endfor %}
+{% endfor -%}
