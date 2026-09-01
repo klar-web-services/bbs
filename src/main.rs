@@ -42,6 +42,7 @@ async fn run() -> Result<u8> {
             eprintln!(
                 "Create a scoped Bitbucket API token with read:workspace:bitbucket and read:repository:bitbucket."
             );
+            eprintln!("Mint one at https://id.atlassian.com/manage-profile/security/api-tokens");
             let token = if args.token_stdin {
                 let mut input = String::new();
                 io::stdin().read_to_string(&mut input)?;
