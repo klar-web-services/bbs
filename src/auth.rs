@@ -99,7 +99,15 @@ fn env_token() -> Option<String> {
 
 /// Orders what was found. Split from the lookups so the precedence rule can be
 /// tested without a credential store or a process-wide environment variable.
-fn order(stored: Option<String>, env: Option<String>, prefer_env: bool) -> Result<Credentials> {
+///
+/// `Ok(None)` is "nothing to present", which `bbs auth status` reports as a
+/// state rather than a failure; an `Err` is a real fault, such as
+/// `--env-token` with nothing in the environment.
+fn order(
+    stored: Option<String>,
+    env: Option<String>,
+    prefer_env: bool,
+) -> Result<Option<Credentials>> {
     if prefer_env && env.is_none() {
         bail!("--env-token was passed but {ENV_VAR} is unset or empty");
     }
@@ -125,15 +133,24 @@ fn order(stored: Option<String>, env: Option<String>, prefer_env: bool) -> Resul
         }
     }
     if candidates.is_empty() {
-        bail!("not logged in; run `bbs login` or set {ENV_VAR}");
+        return Ok(None);
     }
-    Ok(Credentials(candidates))
+    Ok(Some(Credentials(candidates)))
 }
 
-/// The credentials for this run. `prefer_env` is `--env-token`.
-pub fn credentials(prefer_env: bool) -> Result<Credentials> {
+/// The credentials for this run, or `None` when there are none to present.
+/// `prefer_env` is `--env-token`.
+pub fn lookup(prefer_env: bool) -> Result<Option<Credentials>> {
     order(stored_token(), env_token(), prefer_env)
 }
+
+/// The credentials for this run, refusing to continue without one.
+pub fn credentials(prefer_env: bool) -> Result<Credentials> {
+    lookup(prefer_env)?.ok_or_else(|| anyhow::anyhow!(NOT_LOGGED_IN))
+}
+
+/// Named because `bbs auth status` prints it too, and the two must not drift.
+pub const NOT_LOGGED_IN: &str = "not logged in; run `bbs login` or set BB_TOKEN";
 
 pub fn store_token(value: &str) -> Result<()> {
     let entry = keyring::Entry::new(SERVICE, ACCOUNT)
@@ -168,7 +185,9 @@ mod tests {
     /// shadow it outright, so `bbs login` appeared to do nothing.
     #[test]
     fn a_saved_credential_outranks_the_environment() {
-        let credentials = order(Some("saved".into()), Some("env".into()), false).unwrap();
+        let credentials = order(Some("saved".into()), Some("env".into()), false)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             tokens(&credentials),
             [(Source::Saved, "saved"), (Source::Environment, "env")]
@@ -182,11 +201,11 @@ mod tests {
     #[test]
     fn the_environment_is_the_fallback_and_the_only_credential_when_alone() {
         assert_eq!(
-            tokens(&order(None, Some("env".into()), false).unwrap()),
+            tokens(&order(None, Some("env".into()), false).unwrap().unwrap()),
             [(Source::Environment, "env")]
         );
         assert_eq!(
-            tokens(&order(Some("saved".into()), None, false).unwrap()),
+            tokens(&order(Some("saved".into()), None, false).unwrap().unwrap()),
             [(Source::Saved, "saved")]
         );
     }
@@ -194,7 +213,11 @@ mod tests {
     #[test]
     fn env_token_asks_for_the_environment_first() {
         assert_eq!(
-            tokens(&order(Some("saved".into()), Some("env".into()), true).unwrap()),
+            tokens(
+                &order(Some("saved".into()), Some("env".into()), true)
+                    .unwrap()
+                    .unwrap()
+            ),
             [(Source::Environment, "env"), (Source::Saved, "saved")]
         );
     }
@@ -211,16 +234,20 @@ mod tests {
 
     #[test]
     fn one_token_in_both_places_is_presented_once() {
-        let credentials = order(Some("same".into()), Some("same".into()), false).unwrap();
+        let credentials = order(Some("same".into()), Some("same".into()), false)
+            .unwrap()
+            .unwrap();
         assert_eq!(tokens(&credentials), [(Source::Saved, "same")]);
     }
 
+    /// Nothing saved is a *state*, not a fault: `bbs auth status` has to be
+    /// able to report it without an error, while a search still refuses to run.
     #[test]
-    fn no_credential_at_all_names_both_ways_to_supply_one() {
-        let error = order(None, None, false).unwrap_err().to_string();
+    fn no_credential_at_all_is_absence_rather_than_failure() {
+        assert!(order(None, None, false).unwrap().is_none());
         assert!(
-            error.contains("bbs login") && error.contains("BB_TOKEN"),
-            "{error}"
+            NOT_LOGGED_IN.contains("bbs login") && NOT_LOGGED_IN.contains(ENV_VAR),
+            "{NOT_LOGGED_IN}"
         );
     }
 
@@ -228,6 +255,7 @@ mod tests {
     fn a_rejection_can_name_everything_it_presented() {
         assert_eq!(
             order(Some("saved".into()), Some("env".into()), false)
+                .unwrap()
                 .unwrap()
                 .describe_all(),
             "the saved credential and BB_TOKEN"
