@@ -135,6 +135,8 @@ fn documented_durations_parse() {
     assert_eq!(parse_duration_secs("5m").unwrap(), 300);
     assert_eq!(parse_duration_secs("1h30m").unwrap(), 5400);
     assert_eq!(parse_duration_secs("2d").unwrap(), 172_800);
+    assert_eq!(parse_duration_secs("6h").unwrap(), 21_600);
+    assert_eq!(parse_duration_secs("20h").unwrap(), 72_000);
     assert_eq!(parse_duration_secs("90").unwrap(), 90);
 }
 

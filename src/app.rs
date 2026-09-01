@@ -4,7 +4,9 @@ use crate::{
     cache,
     config::Config,
     git_sync,
-    model::{RepositoryCatalog, SearchEvent, SearchResponse, SkippedRepository, Snapshot},
+    model::{
+        Repository, RepositoryCatalog, SearchEvent, SearchResponse, SkippedRepository, Snapshot,
+    },
     query::{CaseMode, CompiledQuery, QueryOptions},
     search::{self, Presentation, ScanOptions as SearchOptions, SortMode},
 };
@@ -22,6 +24,25 @@ fn one_line(error: &anyhow::Error) -> String {
         .map(|cause| cause.to_string())
         .collect::<Vec<_>>()
         .join(": ")
+}
+
+/// The single error to raise when not one repository could be prepared.
+///
+/// Every failure is collected rather than raised, so a problem that is really
+/// account-wide -- an expired credential, no network -- would otherwise report
+/// one repository per line.
+fn nothing_prepared(action: &str, skipped: &[SkippedRepository]) -> anyhow::Error {
+    const NAMED: usize = 5;
+    let mut detail = skipped
+        .iter()
+        .take(NAMED)
+        .map(|s| format!("{} ({})", s.repository, s.reason))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(rest) = skipped.len().checked_sub(NAMED).filter(|rest| *rest > 0) {
+        detail.push_str(&format!(", and {rest} more"));
+    }
+    anyhow::anyhow!("no repository could be {action}: {detail}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +92,39 @@ impl Default for SearchRequest {
             no_cache: false,
         }
     }
+}
+
+/// A `bbs warmup`: everything a search does before it looks at a file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WarmupRequest {
+    /// Repositories, patterns included. Empty warms every accessible one.
+    pub repositories: Vec<String>,
+    /// Warm this branch rather than each repository's default branch.
+    pub branch: Option<String>,
+    /// Leave alone any snapshot fetched within this many seconds, so a
+    /// repeated warmup pays only for what has gone stale.
+    pub max_age_seconds: Option<u64>,
+    /// Repositories to fetch at once. `None` uses `sync_concurrency`.
+    pub concurrency: Option<usize>,
+}
+
+/// What one warmup did. The counts are what a scheduled warmup needs to tell
+/// a slow network from a shrinking workspace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WarmupReport {
+    /// Repositories selected, before any of them failed.
+    pub repositories: usize,
+    /// Snapshots ready on disk afterwards: `fetched` plus `reused`.
+    pub warmed: usize,
+    /// Snapshots this run cloned or fetched from the remote.
+    pub fetched: usize,
+    /// Snapshots already inside the freshness window, left untouched.
+    pub reused: usize,
+    pub skipped: Vec<SkippedRepository>,
+    /// Bytes the snapshot cache occupies afterwards.
+    pub snapshot_bytes: u64,
+    pub elapsed_ms: u128,
 }
 
 #[derive(Clone)]
@@ -170,6 +224,164 @@ impl BbsApp {
         Ok(summary)
     }
 
+    /// Clones or fetches every repository in parallel and reports both what
+    /// came back and what could not.
+    ///
+    /// Shared by `search` and `warmup` so warming cannot drift from what a
+    /// search consumes: whatever this leaves on disk is exactly what the next
+    /// search finds there. `credentials` of `None` is the offline path, which
+    /// reads snapshots already present rather than contacting any remote.
+    async fn prepare_snapshots(
+        &self,
+        repositories: Vec<Repository>,
+        branch_override: Option<String>,
+        credentials: Option<Credentials>,
+        max_age: Option<std::time::Duration>,
+        concurrency: usize,
+        progress: &Progress,
+    ) -> Result<(Vec<Snapshot>, Vec<SkippedRepository>)> {
+        let total = repositories.len();
+        let config = self.config.clone();
+        let progress_sync = progress.clone();
+        let concurrency = concurrency.max(1);
+        let mut completed = 0usize;
+        let jobs = stream::iter(repositories.into_iter().map(|repository| {
+            let config = config.clone();
+            let credentials = credentials.clone();
+            let branch_override = branch_override.clone();
+            async move {
+                let full_name = repository.full_name.clone();
+                let Some(branch) = branch_override.or(repository.default_branch.clone()) else {
+                    return Ok((
+                        full_name,
+                        None,
+                        git_sync::Sync::Unavailable("no default branch".into()),
+                    ));
+                };
+                let prepared = tokio::task::spawn_blocking({
+                    let branch = branch.clone();
+                    move || match credentials {
+                        Some(credentials) => git_sync::synchronize(
+                            &config,
+                            &repository,
+                            &branch,
+                            &credentials,
+                            max_age,
+                        ),
+                        None => git_sync::load_offline(&config, &repository, &branch),
+                    }
+                })
+                .await
+                .context("snapshot task failed")?;
+                // A repository that cannot be prepared is named in `skipped`
+                // rather than raised. `git_sync` already demotes an empty
+                // repository and a missing branch, but a revoked permission, a
+                // remote that no longer answers, or an unusable clone URL would
+                // otherwise still fail the run for every other repository.
+                let outcome =
+                    prepared.unwrap_or_else(|error| git_sync::Sync::Unavailable(one_line(&error)));
+                anyhow::Ok((full_name, Some(branch), outcome))
+            }
+        }))
+        .buffer_unordered(concurrency);
+        tokio::pin!(jobs);
+        let mut snapshots: Vec<Snapshot> = Vec::new();
+        let mut skipped: Vec<SkippedRepository> = Vec::new();
+        while let Some(outcome) = jobs.next().await {
+            let (full_name, branch, outcome) = outcome?;
+            match outcome {
+                git_sync::Sync::Ready(snapshot) => snapshots.push(*snapshot),
+                git_sync::Sync::Unavailable(reason) => {
+                    (progress_sync)(SearchEvent::Warning {
+                        message: format!("skipped {full_name}: {reason}"),
+                    });
+                    skipped.push(SkippedRepository {
+                        repository: full_name,
+                        branch,
+                        reason,
+                    });
+                }
+            }
+            completed += 1;
+            (progress_sync)(SearchEvent::Progress {
+                phase: "sync".into(),
+                message: format!("Synchronized {completed} of {total} repositories"),
+                current: completed,
+                total,
+            });
+        }
+        skipped.sort_by(|a, b| a.repository.cmp(&b.repository));
+        Ok((snapshots, skipped))
+    }
+
+    /// Pays a search's setup cost up front.
+    ///
+    /// The first query against a large workspace spends nearly all its time
+    /// discovering repositories and cloning them, which makes an otherwise
+    /// fast tool feel slow exactly once per machine -- and again after every
+    /// prune. Warming does that half on its own schedule, so the search that
+    /// follows starts at the scan. There is no separate index to build: what a
+    /// warmed cache saves a later search is precisely its `sync_ms`.
+    pub async fn warmup(&self, request: WarmupRequest, progress: Progress) -> Result<WarmupReport> {
+        let started = std::time::Instant::now();
+        // Warming writes the same snapshots a search reads, so it takes the
+        // same lock: a warmup and a search running at once would otherwise
+        // fetch the same repository twice.
+        let lock_config = self.config.clone();
+        let _search_lock =
+            tokio::task::spawn_blocking(move || git_sync::lock_searches(&lock_config))
+                .await
+                .context("search lock task failed")??;
+        let max_age = request.max_age_seconds.map(std::time::Duration::from_secs);
+        (progress)(SearchEvent::Progress {
+            phase: "discovery".into(),
+            message: "Discovering accessible repositories".into(),
+            current: 0,
+            total: 0,
+        });
+        // Discovery is always refetched, even under `--max-age`: warming from
+        // a stale catalog would silently leave out every repository created
+        // since, which is the one thing a warmup exists to avoid. The window
+        // applies to the fetches, which are where the time goes.
+        let catalog = self.catalog(false, None).await?;
+        let repositories = bitbucket::resolve_repositories(&catalog, &request.repositories)?;
+        if repositories.is_empty() {
+            bail!("no accessible repositories were found");
+        }
+        let selected = repositories.len();
+        // Taken before the fetches, so a snapshot still stamped earlier than
+        // this is one the freshness window let us leave alone. It is the only
+        // honest way to say what the run actually cost.
+        let cutoff = chrono::Utc::now();
+        let (snapshots, skipped) = self
+            .prepare_snapshots(
+                repositories,
+                request.branch.clone(),
+                Some(self.credentials()?),
+                max_age,
+                request.concurrency.unwrap_or(self.config.sync_concurrency),
+                &progress,
+            )
+            .await?;
+        if snapshots.is_empty() {
+            return Err(nothing_prepared("warmed", &skipped));
+        }
+        let reused = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.synchronized_at < cutoff)
+            .count();
+        let report = WarmupReport {
+            repositories: selected,
+            warmed: snapshots.len(),
+            fetched: snapshots.len() - reused,
+            reused,
+            skipped,
+            snapshot_bytes: cache::status(&self.config, false)?.snapshot_bytes,
+            elapsed_ms: started.elapsed().as_millis(),
+        };
+        Ok(report)
+    }
+
     pub async fn search(
         &self,
         request: SearchRequest,
@@ -211,93 +423,18 @@ impl BbsApp {
         } else {
             Some(self.credentials()?)
         };
-        let total = repositories.len();
-        let config = self.config.clone();
-        let branch_override = request.branch.clone();
-        let progress_sync = progress.clone();
-        let concurrency = self.config.sync_concurrency.max(1);
-        let mut completed = 0usize;
-        let jobs = stream::iter(repositories.into_iter().map(|repository| {
-            let config = config.clone();
-            let credentials = credentials.clone();
-            let branch_override = branch_override.clone();
-            async move {
-                let full_name = repository.full_name.clone();
-                let Some(branch) = branch_override.or(repository.default_branch.clone()) else {
-                    return Ok((
-                        full_name,
-                        None,
-                        git_sync::Sync::Unavailable("no default branch".into()),
-                    ));
-                };
-                let prepared = tokio::task::spawn_blocking({
-                    let branch = branch.clone();
-                    move || match credentials {
-                        Some(credentials) => git_sync::synchronize(
-                            &config,
-                            &repository,
-                            &branch,
-                            &credentials,
-                            max_age,
-                        ),
-                        None => git_sync::load_offline(&config, &repository, &branch),
-                    }
-                })
-                .await
-                .context("snapshot task failed")?;
-                // A repository that cannot be prepared is named in `skipped`
-                // rather than raised. `git_sync` already demotes an empty
-                // repository and a missing branch, but a revoked permission, a
-                // remote that no longer answers, or an unusable clone URL would
-                // otherwise still fail the search for every other repository.
-                let outcome =
-                    prepared.unwrap_or_else(|error| git_sync::Sync::Unavailable(one_line(&error)));
-                anyhow::Ok((full_name, Some(branch), outcome))
-            }
-        }))
-        .buffer_unordered(concurrency);
-        tokio::pin!(jobs);
-        let mut snapshots: Vec<Snapshot> = Vec::new();
-        let mut skipped: Vec<SkippedRepository> = Vec::new();
-        while let Some(outcome) = jobs.next().await {
-            let (full_name, branch, outcome) = outcome?;
-            match outcome {
-                git_sync::Sync::Ready(snapshot) => snapshots.push(*snapshot),
-                git_sync::Sync::Unavailable(reason) => {
-                    (progress_sync)(SearchEvent::Warning {
-                        message: format!("skipped {full_name}: {reason}"),
-                    });
-                    skipped.push(SkippedRepository {
-                        repository: full_name,
-                        branch,
-                        reason,
-                    });
-                }
-            }
-            completed += 1;
-            (progress_sync)(SearchEvent::Progress {
-                phase: "sync".into(),
-                message: format!("Synchronized {completed} of {total} repositories"),
-                current: completed,
-                total,
-            });
-        }
-        skipped.sort_by(|a, b| a.repository.cmp(&b.repository));
+        let (mut snapshots, skipped) = self
+            .prepare_snapshots(
+                repositories,
+                request.branch.clone(),
+                credentials,
+                max_age,
+                self.config.sync_concurrency,
+                &progress,
+            )
+            .await?;
         if snapshots.is_empty() {
-            // Every failure now lands here instead of raising, so a problem
-            // that is really account-wide -- an expired credential, no network
-            // -- would otherwise report one repository per line.
-            const NAMED: usize = 5;
-            let mut detail = skipped
-                .iter()
-                .take(NAMED)
-                .map(|s| format!("{} ({})", s.repository, s.reason))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if let Some(rest) = skipped.len().checked_sub(NAMED).filter(|rest| *rest > 0) {
-                detail.push_str(&format!(", and {rest} more"));
-            }
-            bail!("no repository could be searched: {detail}");
+            return Err(nothing_prepared("searched", &skipped));
         }
         snapshots.sort_by(|a, b| a.repository.full_name.cmp(&b.repository.full_name));
         // Fetching seventy repositories and scanning them are very different
@@ -615,6 +752,160 @@ mod tests {
         assert!(second.cached);
         assert_eq!(second.results.len(), 1);
         assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        server.abort();
+    }
+
+    /// Warming must leave behind exactly what a search consumes, so the
+    /// assertion is not "a report was produced" but "an offline search now
+    /// finds the code without ever having run online".
+    #[tokio::test]
+    async fn warmup_clones_the_workspace_and_a_repeat_inside_the_window_reuses_it() {
+        use axum::{Router, routing::get};
+
+        let temp = tempdir().unwrap();
+
+        // a real Git remote on disk, so the warmup genuinely clones
+        let remote = temp.path().join("remote");
+        let git = GitRepository::init(&remote).unwrap();
+        fs::write(remote.join("service.rs"), "fn wanted_symbol() {}\n").unwrap();
+        let mut index = git.index().unwrap();
+        index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_id).unwrap();
+        let signature = Signature::now("bbs", "bbs@example.invalid").unwrap();
+        git.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "fixture",
+            &tree,
+            &[],
+        )
+        .unwrap();
+        git.set_head("refs/heads/main").unwrap();
+
+        // two repositories: one clonable, one that cannot possibly be
+        let clone_url = remote.to_string_lossy().into_owned();
+        let router = Router::new()
+            .route(
+                "/user/workspaces",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "values": [{"workspace": {
+                            "uuid": "{workspace}", "slug": "team", "name": "Team"
+                        }}]
+                    }))
+                }),
+            )
+            .route(
+                "/repositories/{workspace}",
+                get(move || {
+                    let clone_url = clone_url.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "values": [
+                                {
+                                    "uuid": "{repo}", "slug": "api", "name": "API",
+                                    "full_name": "team/api",
+                                    "mainbranch": {"name": "main"},
+                                    "workspace": {"slug": "team"},
+                                    "links": {
+                                        "clone": [{"name": "https", "href": clone_url}],
+                                        "html": {"href": "https://example.invalid/team/api"}
+                                    }
+                                },
+                                {
+                                    "uuid": "{broken}", "slug": "broken", "name": "Broken",
+                                    "full_name": "team/broken",
+                                    "mainbranch": {"name": "main"},
+                                    "workspace": {"slug": "team"},
+                                    "links": {
+                                        "clone": [{"name": "https",
+                                                   "href": "nosuchproto://example.invalid/b.git"}],
+                                        "html": {"href": "https://example.invalid/team/broken"}
+                                    }
+                                }
+                            ]
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            api_base,
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let app = BbsApp::with_token(config.clone(), "stub-token").unwrap();
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = warnings.clone();
+        let progress: Progress = Arc::new(move |event| {
+            if let SearchEvent::Warning { message } = event {
+                collected.lock().unwrap().push(message);
+            }
+        });
+
+        let first = app
+            .warmup(WarmupRequest::default(), progress.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.repositories, 2);
+        assert_eq!(first.warmed, 1);
+        assert_eq!(first.fetched, 1);
+        assert_eq!(first.reused, 0);
+        assert!(first.snapshot_bytes > 0);
+        // one repository that cannot be cloned does not fail the warmup, and
+        // is named while it happens rather than only in the report
+        assert_eq!(first.skipped.len(), 1, "{:?}", first.skipped);
+        assert_eq!(first.skipped[0].repository, "team/broken");
+        assert!(
+            warnings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.contains("team/broken")),
+        );
+
+        // the point of the whole exercise: the next search finds the code
+        // without touching the network
+        let searched = app
+            .search(
+                SearchRequest {
+                    queries: vec!["wanted_symbol".into()],
+                    offline: true,
+                    ..Default::default()
+                },
+                progress.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(searched.results.len(), 1);
+        assert_eq!(searched.results[0].repository, "team/api");
+
+        // and a scheduled repeat inside the window refetches nothing
+        let second = app
+            .warmup(
+                WarmupRequest {
+                    max_age_seconds: Some(3600),
+                    ..Default::default()
+                },
+                progress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.warmed, 1);
+        assert_eq!(second.reused, 1, "a fresh snapshot must not be refetched");
+        assert_eq!(second.fetched, 0);
 
         server.abort();
     }

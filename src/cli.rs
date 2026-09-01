@@ -1,5 +1,5 @@
 use crate::{
-    app::SearchRequest,
+    app::{SearchRequest, WarmupRequest},
     output::{OutputMode, RenderOptions},
     query::CaseMode,
     search::SortMode,
@@ -163,6 +163,9 @@ pub enum Command {
     /// List repositories visible to the authenticated account. Shorthand for
     /// `bbs list repos`.
     Repos(ReposArgs),
+    /// Clone and refresh repositories ahead of time, so the next search
+    /// starts from a warm cache.
+    Warmup(WarmupArgs),
     /// Start the local browser interface.
     Serve(ServeArgs),
     /// Update bbs to the latest published release.
@@ -243,6 +246,43 @@ pub struct AutoUpdateArgs {
 pub enum AutoUpdateState {
     On,
     Off,
+}
+
+#[derive(Debug, Args)]
+pub struct WarmupArgs {
+    /// Repositories as unique slugs, workspace/slug names, UUIDs, or `*`
+    /// patterns. Defaults to every accessible repository.
+    #[arg(long, num_args = 1.., value_delimiter = ',')]
+    pub repos: Vec<String>,
+
+    /// Warm this branch instead of each repository's default branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Leave alone any snapshot fetched within this window, e.g. `6h`, `2d`.
+    /// A scheduled warmup wants this; the default refetches everything.
+    #[arg(long, value_name = "DURATION", value_parser = crate::duration::parse_duration_secs)]
+    pub max_age: Option<u64>,
+
+    /// Repositories to fetch at once. Defaults to the configured
+    /// `sync_concurrency`.
+    #[arg(long, short = 'j', value_name = "N")]
+    pub concurrency: Option<usize>,
+
+    /// Print the report as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl WarmupArgs {
+    pub fn request(&self) -> WarmupRequest {
+        WarmupRequest {
+            repositories: self.repos.clone(),
+            branch: self.branch.clone(),
+            max_age_seconds: self.max_age,
+            concurrency: self.concurrency,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -355,6 +395,42 @@ mod tests {
             assert_eq!(args.pattern(), Some("edge-*"), "for {argv:?}");
             assert!(!args.regex, "for {argv:?}");
         }
+    }
+
+    #[test]
+    fn warmup_defaults_to_the_whole_workspace_and_takes_the_search_scopes() {
+        let bare = match Cli::try_parse_from(["bbs", "warmup"]).unwrap().command {
+            Some(Command::Warmup(args)) => args.request(),
+            other => panic!("parsed as {other:?}"),
+        };
+        assert!(bare.repositories.is_empty());
+        assert_eq!(bare.branch, None);
+        assert_eq!(bare.max_age_seconds, None);
+        assert_eq!(bare.concurrency, None);
+
+        let scoped = match Cli::try_parse_from([
+            "bbs",
+            "warmup",
+            "--repos",
+            "edge-*",
+            "team/api",
+            "--branch",
+            "develop",
+            "--max-age",
+            "6h",
+            "-j",
+            "16",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Command::Warmup(args)) => args.request(),
+            other => panic!("parsed as {other:?}"),
+        };
+        assert_eq!(scoped.repositories, ["edge-*", "team/api"]);
+        assert_eq!(scoped.branch.as_deref(), Some("develop"));
+        assert_eq!(scoped.max_age_seconds, Some(6 * 60 * 60));
+        assert_eq!(scoped.concurrency, Some(16));
     }
 
     /// Two spellings of one value would otherwise have to be silently ranked.

@@ -115,6 +115,19 @@ async fn run() -> Result<u8> {
             }
             Ok(0)
         }
+        Some(Command::Warmup(args)) => {
+            let spinner = spinner("Warming up");
+            let progress = spinner_progress(&spinner);
+            let warmed = app.warmup(args.request(), progress).await;
+            spinner.finish_and_clear();
+            let report = warmed?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", output::warmup_summary(&report));
+            }
+            Ok(0)
+        }
         Some(Command::Serve(args)) => {
             server::serve(app, args.port.unwrap_or(config.default_port), !args.no_open).await?;
             Ok(0)
@@ -179,17 +192,8 @@ async fn run() -> Result<u8> {
             if cli.queries.is_empty() {
                 bail!("a query or command is required; run `bbs --help`");
             }
-            let spinner = search_spinner();
-            let spinner_for_progress = spinner.clone();
-            let progress: Progress = Arc::new(move |event| {
-                if let SearchEvent::Warning { message } = &event {
-                    spinner_for_progress.suspend(|| eprintln!("warning: {message}"));
-                    return;
-                }
-                if let Some(message) = spinner_message(&event) {
-                    spinner_for_progress.set_message(message);
-                }
-            });
+            let spinner = spinner("Preparing search");
+            let progress = spinner_progress(&spinner);
             let search = app
                 .search(
                     cli.search_request(),
@@ -350,7 +354,7 @@ async fn update_command(check_only: bool, config: &Config) -> Result<u8> {
     Ok(0)
 }
 
-fn search_spinner() -> ProgressBar {
+fn spinner(initial: &str) -> ProgressBar {
     if !io::stderr().is_terminal() {
         return ProgressBar::hidden();
     }
@@ -360,9 +364,25 @@ fn search_spinner() -> ProgressBar {
             .expect("static spinner template is valid")
             .tick_strings(SPINNER_TICKS),
     );
-    spinner.set_message("Preparing search");
+    spinner.set_message(initial.to_owned());
     spinner.enable_steady_tick(Duration::from_millis(80));
     spinner
+}
+
+/// Drives `spinner` from the progress stream. Warnings are printed above the
+/// spinner rather than into it: a skipped repository is a thing to keep, not a
+/// label to be overwritten by the next event.
+fn spinner_progress(spinner: &ProgressBar) -> Progress {
+    let spinner = spinner.clone();
+    Arc::new(move |event| {
+        if let SearchEvent::Warning { message } = &event {
+            spinner.suspend(|| eprintln!("warning: {message}"));
+            return;
+        }
+        if let Some(message) = spinner_message(&event) {
+            spinner.set_message(message);
+        }
+    })
 }
 
 fn spinner_message(event: &SearchEvent) -> Option<String> {

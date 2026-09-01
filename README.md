@@ -127,6 +127,14 @@ See [docs/usage.md](docs/usage.md) for the full reference: query grammar, scopin
 
 Useful automation options include `--format json`, `--format jsonl`, `--sort`, `--max-results`, `--context`, and `--no-cache`. Exit status is `0` for matches, `1` for no matches, and `2` for errors.
 
+## Warm up first
+
+```sh
+bbs warmup
+```
+
+The first search on a large workspace pays for discovering every repository and cloning it. `bbs warmup` frontloads that, so the next query starts at the scan instead. Scope it with `--repos` and `--branch` exactly as a search, and add `--max-age 6h` to make a repeated or scheduled run refetch only what has gone stale. It writes the same snapshots a search reads, under the same lock, so the two can never disagree about what is cached.
+
 ## Cache and privacy
 
 Managed depth-1 snapshots and compressed result entries use platform-standard cache directories. Result keys include the normalized query, options, repository UUIDs, branches, and exact commit SHAs, so a fetch automatically invalidates stale results.
@@ -137,6 +145,8 @@ bbs cache prune
 bbs cache clear-results
 bbs list repos --offline
 ```
+
+`prune` leaves the next search cold; `bbs warmup` puts it back.
 
 Only tracked UTF-8 text files are searched. Binary files, Git metadata, submodule contents, and hydrated Git LFS payloads are excluded in v1.
 

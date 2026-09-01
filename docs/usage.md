@@ -8,17 +8,18 @@
 | `bbs login` | Save and validate a token |
 | `bbs logout` | Remove the saved token |
 | `bbs list repos [filter]` | List accessible repositories (`bbs repos` is shorthand) |
+| `bbs warmup` | Clone and refresh everything ahead of the first search |
 | `bbs serve` | Start the browser interface |
 | `bbs update` | Upgrade to the latest release |
 | `bbs cache status\|prune\|clear-results\|forget` | Inspect and reclaim cache |
 
 ## Exit codes
 
-| Code | Search | `update --check` |
-| --- | --- | --- |
-| 0 | matches found | already current |
-| 1 | no matches | update available |
-| 2 | error | error |
+| Code | Search | `update --check` | `warmup` |
+| --- | --- | --- | --- |
+| 0 | matches found | already current | at least one repository warmed |
+| 1 | no matches | update available | — |
+| 2 | error | error | error, or nothing could be warmed |
 
 Use these in scripts: `bbs "TODO" --format json || [ $? -eq 1 ]`. The code follows what
 *matched*, not what was displayed, so `--max-results 0` on a query with matches still exits `0`.
@@ -295,6 +296,53 @@ reused inside the window is **not** labelled stale — the freshness you asked f
 `synchronized_at` still reports its real age. Unlike `--offline`, a repository that was never
 synced is still fetched rather than skipped.
 
+To pay that cost up front instead of inside a query, see [Warming up](#warming-up).
+
+## Warming up
+
+The first search against a large workspace spends nearly all its time on work
+that has nothing to do with the query: discovering the repositories, then
+cloning each one. `bbs warmup` does that half on its own schedule, so the
+search that follows starts at the scan.
+
+```sh
+bbs warmup                            # every accessible repository
+bbs warmup --repos team/api 'edge-*'  # only these
+bbs warmup --branch develop           # a branch other than each default
+bbs warmup --max-age 6h -j 16         # a scheduled refresh, 16 fetches at once
+bbs warmup --json                     # the report, for a cron job to read
+```
+
+It warms exactly what a search consumes — the same snapshots, written under the
+same lock — so nothing can drift between the two. There is no separate index to
+build: what a warm cache saves a later search is precisely the `sync` half of
+`--stats`.
+
+`--max-age` is what makes a *repeated* warmup cheap: any snapshot fetched inside
+the window is left alone, and the report says how many that was.
+
+```
+Warmed 68 of 70 repositories in 3m12s: 54 fetched, 14 already fresh.
+2 could not be warmed; see the warnings above.
+Snapshots on disk: 4.2 GiB. Searches now start at the scan.
+```
+
+Repository discovery is always refetched, even under `--max-age`. Warming from a
+stale catalog would silently leave out every repository created since, which is
+the one thing a warmup exists to avoid; the window applies to the fetches, which
+are where the time goes.
+
+A repository that cannot be cloned is reported as a warning and counted in
+`skipped`, not raised — one revoked permission must not cost you the other
+sixty-nine. Warmup exits `2` only when *nothing* could be warmed, which is the
+signal a scheduled run should alert on.
+
+Run it after `bbs login`, after `bbs cache prune`, or on a timer:
+
+```sh
+0 7 * * * bbs warmup --max-age 20h --json >> ~/.local/state/bbs-warmup.log 2>&1
+```
+
 ## Browser interface
 
 ```sh
@@ -348,7 +396,7 @@ bbs cache clear-results       # drop cached results, keep snapshots
 bbs cache forget team/api     # drop one repository's snapshots, all branches
 ```
 
-`prune` removes least-recently-used snapshots and results. `clear-results` keeps clones, so the next search rescans without refetching. `forget` takes the same names and patterns as `--repos`.
+`prune` removes least-recently-used snapshots and results, which leaves the next search cold again — follow it with `bbs warmup` if that search is about to happen. `clear-results` keeps clones, so the next search rescans without refetching. `forget` takes the same names and patterns as `--repos`.
 
 Each snapshot is described by a `<branch-hash>.meta.json` file beside it, naming its repository,
 branch, commit and fetch time. That is what `status --verbose` reads, what `--max-age` checks, and

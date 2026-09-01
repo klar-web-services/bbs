@@ -1,4 +1,5 @@
 use crate::{
+    app::WarmupReport,
     cli::{ColorChoice, OutputFormat},
     model::{
         ResultLine, SearchResponse, SearchResult, SkippedFiles, SkippedRepository, Truncation,
@@ -332,6 +333,68 @@ pub fn stats_block(response: &SearchResponse) -> String {
     )
 }
 
+/// What `bbs warmup` prints when it finishes.
+///
+/// Every skip is already reported as a warning while it happens, so this
+/// counts them rather than listing them again. The split between fetched and
+/// reused is what makes a repeated `--max-age` warmup legible: without it, a
+/// run that did almost nothing looks the same as one that refetched the world.
+pub fn warmup_summary(report: &WarmupReport) -> String {
+    let mut lines = vec![format!(
+        "Warmed {} of {} repositories in {}: {} fetched, {} already fresh.",
+        report.warmed,
+        report.repositories,
+        human_duration(report.elapsed_ms),
+        report.fetched,
+        report.reused,
+    )];
+    if !report.skipped.is_empty() {
+        lines.push(format!(
+            "{} could not be warmed; see the warnings above.",
+            report.skipped.len()
+        ));
+    }
+    lines.push(format!(
+        "Snapshots on disk: {}. Searches now start at the scan.",
+        human_bytes(report.snapshot_bytes)
+    ));
+    lines.join("\n")
+}
+
+/// Cache sizes are reported in bytes everywhere they are machine-read. On a
+/// terminal, "4.2 GiB" is the number a person can act on.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    match unit {
+        0 => format!("{bytes} B"),
+        _ => format!("{value:.1} {}", UNITS[unit]),
+    }
+}
+
+/// A warmup runs for minutes, not the milliseconds a search reports.
+fn human_duration(ms: u128) -> String {
+    // Under a second, "0.0s" reads as a broken clock rather than as a fast
+    // run, and milliseconds are what the rest of the tool reports anyway.
+    if ms < 1000 {
+        return format!("{ms} ms");
+    }
+    let seconds = ms / 1000;
+    if seconds < 60 {
+        return format!("{:.1}s", ms as f64 / 1000.0);
+    }
+    let (minutes, seconds) = (seconds / 60, seconds % 60);
+    if minutes < 60 {
+        return format!("{minutes}m{seconds:02}s");
+    }
+    format!("{}h{:02}m{seconds:02}s", minutes / 60, minutes % 60)
+}
+
 /// The one line that says what happened. It has to carry three things the user
 /// cannot otherwise see: files the scan walked past, results the display
 /// dropped, and repositories that could not contribute at all.
@@ -533,6 +596,56 @@ mod tests {
 
     /// `jq -r .repository` must keep working on result lines, and a script must
     /// be able to tell a result apart from the summary.
+    #[test]
+    fn the_warmup_summary_separates_work_done_from_work_skipped() {
+        let report = WarmupReport {
+            repositories: 70,
+            warmed: 68,
+            fetched: 54,
+            reused: 14,
+            skipped: vec![SkippedRepository {
+                repository: "team/legacy".into(),
+                branch: Some("main".into()),
+                reason: "no branch `main`".into(),
+            }],
+            snapshot_bytes: 4_509_715_660,
+            elapsed_ms: 192_000,
+        };
+        let summary = warmup_summary(&report);
+        assert!(
+            summary.contains("Warmed 68 of 70 repositories"),
+            "{summary}"
+        );
+        assert!(summary.contains("3m12s"), "{summary}");
+        assert!(
+            summary.contains("54 fetched, 14 already fresh"),
+            "{summary}"
+        );
+        assert!(summary.contains("1 could not be warmed"), "{summary}");
+        assert!(summary.contains("4.2 GiB"), "{summary}");
+
+        // nothing skipped, nothing said about skips
+        let clean = warmup_summary(&WarmupReport {
+            skipped: vec![],
+            ..report
+        });
+        assert!(!clean.contains("could not be warmed"), "{clean}");
+    }
+
+    #[test]
+    fn sizes_and_durations_read_as_quantities_a_person_can_act_on() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(human_duration(16), "16 ms");
+        assert_eq!(human_duration(999), "999 ms");
+        assert_eq!(human_duration(1400), "1.4s");
+        assert_eq!(human_duration(59_400), "59.4s");
+        assert_eq!(human_duration(60_000), "1m00s");
+        assert_eq!(human_duration(3_723_000), "1h02m03s");
+    }
+
     #[test]
     fn jsonl_tags_result_lines_and_ends_with_one_summary() {
         let lines = jsonl_lines(&response()).unwrap();
