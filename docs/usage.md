@@ -7,6 +7,8 @@
 | `bbs <query>...` | Search |
 | `bbs login` | Save and validate a token |
 | `bbs logout` | Remove the saved token |
+| `bbs auth status` | Report whether a credential is available |
+| `bbs skill` | Install the bundled coding-agent skill |
 | `bbs list repos [filter]` | List accessible repositories (`bbs repos` is shorthand) |
 | `bbs warmup` | Clone and refresh everything ahead of the first search |
 | `bbs serve` | Start the browser interface |
@@ -15,11 +17,11 @@
 
 ## Exit codes
 
-| Code | Search | `update --check` | `warmup` |
-| --- | --- | --- | --- |
-| 0 | matches found | already current | at least one repository warmed |
-| 1 | no matches | update available | — |
-| 2 | error | error | error, or nothing could be warmed |
+| Code | Search | `auth status` | `update --check` | `warmup` |
+| --- | --- | --- | --- | --- |
+| 0 | matches found | credential available | already current | at least one repository warmed |
+| 1 | no matches | none available | update available | — |
+| 2 | error | error | error | error, or nothing could be warmed |
 
 Use these in scripts: `bbs "TODO" --format json || [ $? -eq 1 ]`. The code follows what
 *matched*, not what was displayed, so `--max-results 0` on a query with matches still exits `0`.
@@ -364,9 +366,19 @@ bbs serve --no-open
 ```sh
 bbs login                       # prompts, no echo
 echo "$TOKEN" | bbs login --token-stdin
+bbs auth status                 # is there a credential at all?
+bbs auth status --verify        # ...and does Bitbucket still accept it?
+bbs auth status --json          # the same answer, machine-readable
 BB_TOKEN=... bbs "query"        # used only if there is no saved credential
 bbs --env-token "query"         # use BB_TOKEN even though one is saved
 ```
+
+`auth status` is local-only by default: it reports which credential *would* be presented
+without spending a round trip proving it, and exits `1` rather than `2` when there is
+none, because having no credential yet is a state and not a failure. `--verify` presents
+it and reports how many repositories it can read. That split is what lets a script — or
+the bundled agent skill — branch on setup without either lying about a stale token or
+paying for discovery on every check.
 
 Token scopes: `read:workspace:bitbucket`, `read:repository:bitbucket`.
 
@@ -376,6 +388,53 @@ what a saved credential falls through to once Bitbucket answers 401 — so an
 expired token is a warning on stderr rather than a failed run. `--env-token`
 reverses the order for one run, and fails outright if `BB_TOKEN` is unset
 rather than quietly using the credential it was asked to bypass.
+
+## Coding-agent skill
+
+`bbs` bundles an [Agent Skill](https://agentskills.io): a `SKILL.md` and two reference
+files that teach a coding agent to use the CLI well — the query grammar, how to scope
+before searching, which flags are display-only and so served from cache, and the two
+commands (`bbs serve`, `bbs login`) an agent must never run because both block.
+
+```sh
+bbs skill                               # pick from the agents found on this machine
+bbs skill --list                        # every known agent, its path, and whether it is here
+bbs skill --all                         # install into all detected agents
+bbs skill --harness claude-code,codex   # install into named agents, detected or not
+bbs skill --print                       # write SKILL.md to stdout
+bbs skill --force                       # replace a `bbs` skill bbs did not write
+```
+
+The picker moves with the arrow keys, toggles with space, and installs everything still
+ticked when you press enter. Everything detected starts ticked.
+
+| Harness | Personal skills directory |
+| --- | --- |
+| `claude-code` | `~/.claude/skills/` |
+| `codex` | `~/.agents/skills/` |
+| `cursor` | `~/.cursor/skills/` |
+| `opencode` | `$XDG_CONFIG_HOME/opencode/skills/` |
+| `gemini-cli` | `~/.gemini/skills/` |
+| `copilot` | `~/.copilot/skills/` |
+| `amp` | `$XDG_CONFIG_HOME/amp/skills/` |
+| `droid` | `~/.factory/skills/` |
+
+A harness counts as detected when its executable is on `PATH` or its configuration
+directory exists; `--harness` installs into one regardless, for a machine where the
+agent is not installed yet. `~/.agents/skills` is the cross-vendor location the Agent
+Skills standard defines, so the `codex` copy is also read by Cursor, Gemini CLI, Amp,
+Copilot and Droid — installing to those separately is only needed if you want the skill
+to survive one of the directories being cleared.
+
+Installing is idempotent: an unchanged skill reports `already up to date`, an outdated
+one is rewritten, and a `bbs` skill without the bundled provenance marker is left alone
+until `--force`, so a hand-written skill of the same name is never destroyed silently.
+Restart the agent, or start a new session, to pick up `/bbs`.
+
+The skill runs `bbs auth status` before anything else. With no credential it either
+explains the setup, when you invoked it by name, or stops without a word, when the agent
+loaded it on its own — an unconfigured tool should not interrupt a task that never asked
+for it.
 
 ## Updating
 

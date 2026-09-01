@@ -2,10 +2,13 @@ use anyhow::{Context, Result, bail};
 use better_bitbucket_search::{
     app::{BbsApp, Progress},
     auth, bitbucket, cache,
-    cli::{AutoUpdateState, CacheCommand, Cli, Command, ListCommand},
+    cli::{
+        AuthCommand, AuthStatusArgs, AutoUpdateState, CacheCommand, Cli, Command, ListCommand,
+        SkillArgs,
+    },
     config::Config,
     model::{RepositoryCatalog, SearchEvent},
-    output, server, update, update_check,
+    output, server, skill, update, update_check,
 };
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -69,6 +72,10 @@ async fn run() -> Result<u8> {
             println!("Removed the saved Bitbucket credential.");
             Ok(0)
         }
+        Some(Command::Auth {
+            command: AuthCommand::Status(args),
+        }) => auth_status(&app, args, cli.env_token).await,
+        Some(Command::Skill(args)) => skill_command(args),
         Some(Command::Repos(args))
         | Some(Command::List {
             command: ListCommand::Repos(args),
@@ -310,6 +317,162 @@ async fn auto_update(current: update::Version, latest: update::Version) -> Resul
             .context("cannot restart bbs after updating")?;
         Ok(status.code().unwrap_or(2) as u8)
     }
+}
+
+/// Reports the credential without judging it, unless asked to.
+///
+/// The local answer is the one worth having by default: it is instant, it
+/// needs no network, and it is what a coding agent checks before deciding
+/// whether it can help at all. `--verify` is the slower, stronger claim.
+async fn auth_status(app: &BbsApp, args: &AuthStatusArgs, prefer_env: bool) -> Result<u8> {
+    let Some(credentials) = auth::lookup(prefer_env)? else {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "authenticated": false,
+                    "source": serde_json::Value::Null,
+                    "detail": auth::NOT_LOGGED_IN,
+                })
+            );
+        } else {
+            println!("Not logged in. Run `bbs login`, or set BB_TOKEN.");
+        }
+        return Ok(1);
+    };
+    let source = credentials.primary().source.describe();
+    if !args.verify {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "authenticated": true,
+                    "source": source,
+                    "verified": false,
+                })
+            );
+        } else {
+            println!("A Bitbucket credential is available: {source}.");
+        }
+        return Ok(0);
+    }
+    // Discovery is the cheapest call that proves the token can actually read
+    // something, and it refreshes the catalog while it is there.
+    let catalog = app.catalog(false, None).await?;
+    let count = catalog.repositories.len();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "authenticated": true,
+                "source": source,
+                "verified": true,
+                "repositories": count,
+            })
+        );
+    } else {
+        println!("Authenticated with {source}: {count} accessible repositories.");
+    }
+    Ok(0)
+}
+
+/// Installs the bundled agent skill.
+fn skill_command(args: &SkillArgs) -> Result<u8> {
+    let harnesses = skill::harnesses()?;
+    if args.print {
+        print!("{}", skill::skill_markdown()?);
+        return Ok(0);
+    }
+    if args.list {
+        for harness in &harnesses {
+            let detection = match &harness.detected {
+                Some(detection) => format!("detected ({detection})"),
+                None => "not detected".to_owned(),
+            };
+            println!(
+                "{:<12} {:<16} {}\n{:<29} {detection}",
+                harness.id,
+                harness.name,
+                harness.skill_dir().display(),
+                "",
+            );
+        }
+        return Ok(0);
+    }
+
+    let selected: Vec<&skill::Harness> = if !args.harnesses.is_empty() {
+        skill::select(&harnesses, &args.harnesses)?
+    } else {
+        let available: Vec<&skill::Harness> =
+            harnesses.iter().filter(|h| h.is_available()).collect();
+        if available.is_empty() {
+            bail!(
+                "no coding agent was detected on this machine; \
+                 run `bbs skill --list` to see the ones bbs knows, \
+                 then `bbs skill --harness <id>` to install anyway"
+            );
+        }
+        if args.all {
+            available
+        } else {
+            choose(&available)?
+        }
+    };
+    if selected.is_empty() {
+        println!("Nothing selected; no skill was installed.");
+        return Ok(0);
+    }
+
+    let mut occupied = false;
+    for harness in &selected {
+        let outcome = skill::install(harness, args.force)?;
+        occupied |= outcome == skill::Outcome::Occupied;
+        println!(
+            "{:<16} {} — {}",
+            harness.name,
+            harness.skill_dir().display(),
+            outcome.describe()
+        );
+        if let Some(note) = harness.note {
+            println!("{:<16} {note}", "");
+        }
+    }
+    if occupied {
+        eprintln!(
+            "\nOne or more skills were left alone. Pass --force to replace them, \
+             or remove them by hand first."
+        );
+        return Ok(2);
+    }
+    println!(
+        "\nRestart the agent, or start a new session, to pick up `/{}`.",
+        skill::SKILL_NAME
+    );
+    Ok(0)
+}
+
+/// The interactive picker: arrows to move, space to toggle, enter to submit.
+fn choose<'a>(available: &[&'a skill::Harness]) -> Result<Vec<&'a skill::Harness>> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        bail!(
+            "cannot prompt without a terminal; pass --all, or --harness <id> \
+             (see `bbs skill --list`)"
+        );
+    }
+    let labels: Vec<String> = available
+        .iter()
+        .map(|harness| format!("{:<16} {}", harness.name, harness.skill_dir().display()))
+        .collect();
+    // Everything detected is checked to begin with: the common case is
+    // "install into all of them", and unchecking is cheaper than checking.
+    let chosen = dialoguer::MultiSelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("Install the bbs skill into (space to toggle, enter to confirm)")
+        .items(&labels)
+        .defaults(&vec![true; available.len()])
+        .report(false)
+        .interact_opt()?
+        .unwrap_or_default();
+    Ok(chosen.into_iter().map(|index| available[index]).collect())
 }
 
 async fn update_command(check_only: bool, config: &Config) -> Result<u8> {

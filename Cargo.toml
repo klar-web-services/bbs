@@ -16,6 +16,7 @@ anyhow = "1.0"
 axum = { version = "0.8", features = ["json", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+dialoguer = { version = "0.12", default-features = false }
 directories = "6.0"
 fs2 = "0.4"
 futures = "0.3"
@@ -51,6 +52,7 @@ zstd = "0.13"
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
+shell-words = "1.1.1"
 
 [profile.release]
 lto = "thin"

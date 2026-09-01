@@ -155,6 +155,13 @@ pub enum Command {
     Login(LoginArgs),
     /// Remove the saved Bitbucket credential.
     Logout,
+    /// Inspect the Bitbucket credential.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Install the bundled coding-agent skill into the agents on this machine.
+    Skill(SkillArgs),
     /// List what bbs can see.
     List {
         #[command(subcommand)]
@@ -177,6 +184,51 @@ pub enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Report whether a credential is available. Exits 0 when one is, 1 when
+    /// none is, and 2 on a real failure, so a script -- or a coding agent --
+    /// can branch on it without parsing prose.
+    Status(AuthStatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AuthStatusArgs {
+    /// Present the credential to Bitbucket, rather than only reporting that
+    /// one exists. Costs a round trip.
+    #[arg(long)]
+    pub verify: bool,
+
+    /// Print the status as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillArgs {
+    /// Install into these harnesses by identifier instead of choosing from a
+    /// menu. May be repeated or comma-separated.
+    #[arg(long = "harness", value_name = "ID", num_args = 1.., value_delimiter = ',')]
+    pub harnesses: Vec<String>,
+
+    /// Install into every harness detected on this machine.
+    #[arg(long, conflicts_with = "harnesses")]
+    pub all: bool,
+
+    /// List the known harnesses, where each one would be installed, and
+    /// whether it was detected. Installs nothing.
+    #[arg(long, conflicts_with_all = ["all", "harnesses", "force", "print"])]
+    pub list: bool,
+
+    /// Write the bundled SKILL.md to standard output. Installs nothing.
+    #[arg(long, conflicts_with_all = ["all", "harnesses", "force"])]
+    pub print: bool,
+
+    /// Replace a skill named `bbs` that bbs did not write.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]

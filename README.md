@@ -55,6 +55,9 @@ Then run:
 bbs login
 ```
 
+`bbs auth status` reports whether a credential is present without touching the network,
+exiting `0` when one is and `1` when none is; `--verify` presents it to Bitbucket.
+
 The token is validated and saved in macOS Keychain, Windows Credential Manager, or Linux Secret Service. It is never written to Git remotes or the filesystem. For development and CI, set `BB_TOKEN` instead: it is used when nothing is saved, and as a fallback when the saved credential has expired. Pass `--env-token` to prefer it outright.
 
 ## Search in your browser
@@ -74,6 +77,35 @@ That is the entire setup. `bbs serve` opens `http://localhost:7337` with the ful
 - `⌘ K` / `Ctrl K` jumps back to the query box, and a running search can be cancelled
 
 It drives the exact same engine as the CLI, so a query returns identical results either way. The server binds only to `127.0.0.1`, validates local Host/Origin headers, and protects mutations with a per-process CSRF token. Use `--port` to select another fixed port or `--no-open` to suppress the browser launch.
+
+## Use it from a coding agent
+
+```sh
+bbs skill
+```
+
+`bbs` ships an [Agent Skill](https://agentskills.io) — a `SKILL.md` and its reference
+files — that teaches a coding agent how to drive the CLI: the query grammar, how to
+scope a search, which flags reuse the cache, and which two commands it must never run
+because they block. `bbs skill` finds the agents installed on this machine and offers
+them in a list; move with the arrow keys, toggle with space, and confirm with enter to
+install into all the ones you picked.
+
+```sh
+bbs skill --list                        # what bbs knows, where each copy goes
+bbs skill --all                         # every detected agent, no prompt
+bbs skill --harness claude-code,codex   # or name them
+bbs skill --print                       # just the SKILL.md, to stdout
+```
+
+Claude Code, Codex, Cursor, opencode, Gemini CLI, GitHub Copilot, Amp, and Factory Droid
+are recognised. Codex's personal skills directory is the shared `~/.agents/skills`, so
+that one copy is picked up by several of the others as well.
+
+The skill checks `bbs auth status` before it does anything. If nothing is set up and the
+agent reached for the skill on its own, it stops silently rather than interrupting the
+task at hand; if you asked for it by name, it tells you what to install or run. A skill
+of the same name that `bbs` did not write is left alone unless you pass `--force`.
 
 ## Search from the terminal
 
