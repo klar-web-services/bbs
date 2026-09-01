@@ -15,6 +15,15 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 pub type Progress = Arc<dyn Fn(SearchEvent) + Send + Sync>;
 
+/// An error and its causes on the one line a skipped repository is given.
+fn one_line(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchRequest {
@@ -209,7 +218,7 @@ impl BbsApp {
                         git_sync::Sync::Unavailable("no default branch".into()),
                     ));
                 };
-                let outcome = tokio::task::spawn_blocking({
+                let prepared = tokio::task::spawn_blocking({
                     let branch = branch.clone();
                     move || match token {
                         Some(token) => {
@@ -219,7 +228,14 @@ impl BbsApp {
                     }
                 })
                 .await
-                .context("snapshot task failed")??;
+                .context("snapshot task failed")?;
+                // A repository that cannot be prepared is named in `skipped`
+                // rather than raised. `git_sync` already demotes an empty
+                // repository and a missing branch, but a revoked permission, a
+                // remote that no longer answers, or an unusable clone URL would
+                // otherwise still fail the search for every other repository.
+                let outcome =
+                    prepared.unwrap_or_else(|error| git_sync::Sync::Unavailable(one_line(&error)));
                 anyhow::Ok((full_name, Some(branch), outcome))
             }
         }))
@@ -250,15 +266,23 @@ impl BbsApp {
                 total,
             });
         }
+        skipped.sort_by(|a, b| a.repository.cmp(&b.repository));
         if snapshots.is_empty() {
-            let detail = skipped
+            // Every failure now lands here instead of raising, so a problem
+            // that is really account-wide -- an expired credential, no network
+            // -- would otherwise report one repository per line.
+            const NAMED: usize = 5;
+            let mut detail = skipped
                 .iter()
+                .take(NAMED)
                 .map(|s| format!("{} ({})", s.repository, s.reason))
                 .collect::<Vec<_>>()
                 .join(", ");
+            if let Some(rest) = skipped.len().checked_sub(NAMED).filter(|rest| *rest > 0) {
+                detail.push_str(&format!(", and {rest} more"));
+            }
             bail!("no repository could be searched: {detail}");
         }
-        skipped.sort_by(|a, b| a.repository.cmp(&b.repository));
         snapshots.sort_by(|a, b| a.repository.full_name.cmp(&b.repository.full_name));
         // Fetching seventy repositories and scanning them are very different
         // costs, and one `elapsed_ms` could not tell them apart.
@@ -625,6 +649,111 @@ mod tests {
             app.catalog(false, Some(std::time::Duration::from_secs(0)))
                 .await
                 .is_err()
+        );
+    }
+
+    /// One repository that cannot be prepared must not fail the search for
+    /// all the others. An empty repository is already reported as
+    /// unavailable, but every other clone failure -- a revoked permission, a
+    /// remote that no longer answers, an unusable clone URL -- still aborted
+    /// the whole workspace-wide search from inside the sync loop.
+    #[tokio::test]
+    async fn one_unclonable_repository_is_skipped_rather_than_failing_the_search() {
+        let temp = tempdir().unwrap();
+        let remote = temp.path().join("remote");
+        let git = GitRepository::init(&remote).unwrap();
+        fs::write(remote.join("service.rs"), "fn wanted_symbol() {}\n").unwrap();
+        let mut index = git.index().unwrap();
+        index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_id).unwrap();
+        let signature = Signature::now("bbs", "bbs@example.invalid").unwrap();
+        git.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "fixture",
+            &tree,
+            &[],
+        )
+        .unwrap();
+        git.set_head("refs/heads/main").unwrap();
+
+        let config = Config {
+            cache_dir: temp.path().join("cache"),
+            config_dir: temp.path().join("config"),
+            // any escape to the network would fail against this
+            api_base: "http://127.0.0.1:1/unused".into(),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        cache::save_catalog(
+            &config,
+            &RepositoryCatalog {
+                discovered_at: Utc::now(),
+                workspaces: vec![],
+                repositories: vec![
+                    Repository {
+                        uuid: "{good}".into(),
+                        workspace: "team".into(),
+                        slug: "api".into(),
+                        name: "API".into(),
+                        full_name: "team/api".into(),
+                        default_branch: Some("main".into()),
+                        clone_url: remote.to_string_lossy().into_owned(),
+                        web_url: "https://example.invalid/team/api".into(),
+                    },
+                    Repository {
+                        uuid: "{broken}".into(),
+                        workspace: "team".into(),
+                        slug: "broken".into(),
+                        name: "Broken".into(),
+                        full_name: "team/broken".into(),
+                        default_branch: Some("main".into()),
+                        clone_url: "nosuchproto://example.invalid/team/broken.git".into(),
+                        web_url: "https://example.invalid/team/broken".into(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let app = BbsApp::with_token(config, "stub-token").unwrap();
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = warnings.clone();
+        let progress: Progress = Arc::new(move |event| {
+            if let SearchEvent::Warning { message } = event {
+                collected.lock().unwrap().push(message);
+            }
+        });
+        let response = app
+            .search(
+                SearchRequest {
+                    queries: vec!["wanted_symbol".into()],
+                    // reuse the catalog above rather than reaching for the API
+                    max_age_seconds: Some(3600),
+                    ..Default::default()
+                },
+                progress,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("one unclonable repository must not fail the search");
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].repository, "team/api");
+        assert_eq!(response.skipped.len(), 1, "{:?}", response.skipped);
+        assert_eq!(response.skipped[0].repository, "team/broken");
+        assert_eq!(response.skipped[0].branch.as_deref(), Some("main"));
+        assert!(!response.skipped[0].reason.is_empty());
+        // and the skip is reported while it happens, not only in the summary
+        let warnings = warnings.lock().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.contains("team/broken")),
+            "{warnings:?}"
         );
     }
 
