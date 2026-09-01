@@ -45,7 +45,7 @@ Then run:
 bbs login
 ```
 
-The token is validated and saved in macOS Keychain, Windows Credential Manager, or Linux Secret Service. It is never written to Git remotes or the filesystem. For development and CI, set `BB_TOKEN` instead.
+The token is validated and saved in macOS Keychain, Windows Credential Manager, or Linux Secret Service. It is never written to Git remotes or the filesystem. For development and CI, set `BB_TOKEN` instead: it is used when nothing is saved, and as a fallback when the saved credential has expired. Pass `--env-token` to prefer it outright.
 
 ## Search in your browser
 

@@ -2,7 +2,7 @@
 
 ## Search flow
 
-1. Resolve `BB_TOKEN` or the OS credential-store entry.
+1. Resolve the credentials to present, in order: the OS credential-store entry, then `BB_TOKEN` as a fallback (reversed by `--env-token`). A 401 from the API, or a rejection at the libgit2 credential callback, moves on to the next one.
 2. Page through `/2.0/user/workspaces` and `/2.0/repositories/{workspace}?role=member`.
 3. Resolve short repository names uniquely and determine the default or requested branch.
 4. Under the cross-process search lock, clone missing snapshots or depth-1 fetch existing ones through libgit2 credential callbacks.

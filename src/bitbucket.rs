@@ -1,14 +1,25 @@
-use crate::model::{Repository, RepositoryCatalog, Workspace};
+use crate::{
+    auth::Credentials,
+    model::{Repository, RepositoryCatalog, Workspace},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[derive(Clone)]
 pub struct BitbucketClient {
     http: Client,
     api_base: String,
-    token: String,
+    credentials: Credentials,
+    /// Which credential is being presented. Shared across clones, and across
+    /// the dozens of requests one discovery walk makes, so a credential
+    /// Bitbucket has rejected is abandoned once rather than per page.
+    active: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,31 +76,59 @@ struct Link {
 }
 
 impl BitbucketClient {
-    pub fn new(api_base: impl Into<String>, token: impl Into<String>) -> Result<Self> {
+    pub fn new(api_base: impl Into<String>, credentials: Credentials) -> Result<Self> {
         let http = Client::builder()
             .user_agent(concat!("bbs/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             http,
             api_base: api_base.into().trim_end_matches('/').into(),
-            token: token.into(),
+            credentials,
+            active: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+    /// Advances to the next credential after a rejection. `true` means the
+    /// request is worth repeating with it.
+    fn fall_back(&self) -> bool {
+        let rejected = self.active.load(Ordering::Relaxed);
+        let Some(next) = self.credentials.all().get(rejected + 1) else {
+            return false;
+        };
+        if self
+            .active
+            .compare_exchange(rejected, rejected + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!(
+                "Bitbucket rejected {}; falling back to {}",
+                self.credentials.all()[rejected].source.describe(),
+                next.source.describe()
+            );
+        }
+        true
+    }
+
+    /// One request, with the rate-limit and server-error retries. The
+    /// credential is read per attempt, so a request repeated after a 401 is
+    /// repeated with the credential that replaced the rejected one.
+    async fn send(&self, url: &str) -> Result<reqwest::Response> {
         let mut attempt = 0u32;
-        let response = loop {
+        loop {
+            let token = self.credentials.all()[self.active.load(Ordering::Relaxed)]
+                .token
+                .clone();
             let response = self
                 .http
                 .get(url)
-                .bearer_auth(&self.token)
+                .bearer_auth(token)
                 .send()
                 .await
                 .with_context(|| format!("request to Bitbucket failed: {url}"))?;
             let retryable = response.status() == StatusCode::TOO_MANY_REQUESTS
                 || response.status().is_server_error();
             if !retryable || attempt >= 3 {
-                break response;
+                return Ok(response);
             }
             let retry_after = response
                 .headers()
@@ -99,10 +138,26 @@ impl BitbucketClient {
             let seconds = retry_after.unwrap_or(1u64 << attempt).min(15);
             tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
             attempt += 1;
+        }
+    }
+
+    async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let response = loop {
+            let response = self.send(url).await?;
+            // A 401 is the only notice Bitbucket gives that a saved credential
+            // has expired. Falling through to the next credential here, rather
+            // than failing outright, is what makes BB_TOKEN a usable fallback.
+            if response.status() == StatusCode::UNAUTHORIZED && self.fall_back() {
+                continue;
+            }
+            break response;
         };
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED {
-            bail!("Bitbucket rejected the credential; run `bbs login` again");
+            bail!(
+                "Bitbucket rejected {}; run `bbs login` again",
+                self.credentials.describe_all()
+            );
         }
         if status == StatusCode::FORBIDDEN {
             bail!(
@@ -419,6 +474,94 @@ pub fn filter_repositories<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A saved credential that Bitbucket has started rejecting falls through
+    /// to the next one rather than failing the run: an expired token is the
+    /// whole reason `BB_TOKEN` is kept on as a fallback.
+    #[tokio::test]
+    async fn a_rejected_credential_falls_through_to_the_next_one() {
+        use crate::auth::{Credential, Source};
+        use axum::{
+            Router, http::HeaderMap, http::StatusCode as HttpStatus, response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        fn accepted(headers: &HeaderMap) -> bool {
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer fresh")
+        }
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let router = Router::new()
+            .route(
+                "/user/workspaces",
+                get(move |headers: HeaderMap| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        if !accepted(&headers) {
+                            return HttpStatus::UNAUTHORIZED.into_response();
+                        }
+                        axum::Json(serde_json::json!({
+                            "values": [{"workspace": {
+                                "uuid": "{workspace}", "slug": "team", "name": "Team"
+                            }}]
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/repositories/{workspace}",
+                get(|headers: HeaderMap| async move {
+                    if !accepted(&headers) {
+                        return HttpStatus::UNAUTHORIZED.into_response();
+                    }
+                    axum::Json(serde_json::json!({"values": []})).into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = BitbucketClient::new(
+            &api_base,
+            Credentials::ordered(vec![
+                Credential {
+                    source: Source::Saved,
+                    token: "expired".into(),
+                },
+                Credential {
+                    source: Source::Environment,
+                    token: "fresh".into(),
+                },
+            ]),
+        )
+        .unwrap();
+        let catalog = client.discover().await.unwrap();
+        assert_eq!(catalog.workspaces.len(), 1);
+        // one rejection, one retry -- and the repository walk that follows
+        // uses the credential that worked rather than being rejected again
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+
+        // with nothing left to fall through to, the rejection is reported and
+        // names what was presented
+        let error = BitbucketClient::new(&api_base, Credentials::supplied("expired"))
+            .unwrap()
+            .discover()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("the supplied token"), "{error}");
+
+        server.abort();
+    }
 
     fn repo(workspace: &str, slug: &str) -> Repository {
         Repository {

@@ -36,7 +36,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<u8> {
     let cli = Cli::parse();
     let config = Config::load()?;
-    let app = BbsApp::new(config.clone())?;
+    let app = BbsApp::new(config.clone())?.preferring_env_token(cli.env_token);
     match &cli.command {
         Some(Command::Login(args)) => {
             eprintln!(

@@ -1,5 +1,5 @@
 use crate::{
-    auth,
+    auth::{self, Credentials},
     bitbucket::{self, BitbucketClient},
     cache,
     config::Config,
@@ -83,7 +83,9 @@ pub struct BbsApp {
     /// come from the process environment or the OS keyring, both of which are
     /// global and cannot be set safely from a parallel test. An "online" test
     /// therefore hit the real network.
-    token: Option<String>,
+    credentials: Option<Credentials>,
+    /// `--env-token`: present `BB_TOKEN` ahead of the saved credential.
+    prefer_env_token: bool,
 }
 
 impl BbsApp {
@@ -91,8 +93,17 @@ impl BbsApp {
         config.ensure_dirs()?;
         Ok(Self {
             config,
-            token: None,
+            credentials: None,
+            prefer_env_token: false,
         })
+    }
+
+    /// Presents `BB_TOKEN` before the saved credential, for `--env-token`.
+    /// The saved credential stays on as a fallback, so the flag reorders the
+    /// two rather than discarding one.
+    pub fn preferring_env_token(mut self, prefer: bool) -> Self {
+        self.prefer_env_token = prefer;
+        self
     }
 
     /// Builds an application that authenticates with `token` rather than
@@ -101,14 +112,15 @@ impl BbsApp {
         config.ensure_dirs()?;
         Ok(Self {
             config,
-            token: Some(token.into()),
+            credentials: Some(Credentials::supplied(token)),
+            prefer_env_token: false,
         })
     }
 
-    fn token(&self) -> Result<String> {
-        match &self.token {
-            Some(token) => Ok(token.clone()),
-            None => auth::token(),
+    fn credentials(&self) -> Result<Credentials> {
+        match &self.credentials {
+            Some(credentials) => Ok(credentials.clone()),
+            None => auth::credentials(self.prefer_env_token),
         }
     }
 
@@ -144,14 +156,14 @@ impl BbsApp {
                 }
             };
         }
-        let client = BitbucketClient::new(&self.config.api_base, self.token()?)?;
+        let client = BitbucketClient::new(&self.config.api_base, self.credentials()?)?;
         let catalog = client.discover().await?;
         cache::save_catalog(&self.config, &catalog)?;
         Ok(catalog)
     }
 
     pub async fn validate_login(&self, token: &str) -> Result<String> {
-        let client = BitbucketClient::new(&self.config.api_base, token)?;
+        let client = BitbucketClient::new(&self.config.api_base, Credentials::supplied(token))?;
         let catalog = client.discover().await?;
         let summary = format!("{} accessible repositories", catalog.repositories.len());
         cache::save_catalog(&self.config, &catalog)?;
@@ -194,10 +206,10 @@ impl BbsApp {
         if repositories.is_empty() {
             bail!("no accessible repositories were found");
         }
-        let token = if request.offline {
+        let credentials = if request.offline {
             None
         } else {
-            Some(self.token()?)
+            Some(self.credentials()?)
         };
         let total = repositories.len();
         let config = self.config.clone();
@@ -207,7 +219,7 @@ impl BbsApp {
         let mut completed = 0usize;
         let jobs = stream::iter(repositories.into_iter().map(|repository| {
             let config = config.clone();
-            let token = token.clone();
+            let credentials = credentials.clone();
             let branch_override = branch_override.clone();
             async move {
                 let full_name = repository.full_name.clone();
@@ -220,10 +232,14 @@ impl BbsApp {
                 };
                 let prepared = tokio::task::spawn_blocking({
                     let branch = branch.clone();
-                    move || match token {
-                        Some(token) => {
-                            git_sync::synchronize(&config, &repository, &branch, &token, max_age)
-                        }
+                    move || match credentials {
+                        Some(credentials) => git_sync::synchronize(
+                            &config,
+                            &repository,
+                            &branch,
+                            &credentials,
+                            max_age,
+                        ),
                         None => git_sync::load_offline(&config, &repository, &branch),
                     }
                 })

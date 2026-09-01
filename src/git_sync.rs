@@ -1,4 +1,5 @@
 use crate::{
+    auth::Credentials,
     config::Config,
     model::{Repository, Snapshot, SnapshotMeta},
 };
@@ -152,20 +153,33 @@ fn lock_snapshot(path: &Path) -> Result<SnapshotLock> {
     Ok(SnapshotLock { _file: file })
 }
 
-fn callbacks<'a>(token: &'a str) -> RemoteCallbacks<'a> {
+fn callbacks(credentials: &Credentials) -> RemoteCallbacks<'_> {
+    let mut asked = 0usize;
     let mut callbacks = RemoteCallbacks::new();
     callbacks.credentials(move |_url, _username, _allowed| {
-        Cred::userpass_plaintext("x-bitbucket-api-token-auth", token)
+        // libgit2 asks again after a rejection, which is the only notice the
+        // Git side gets that a credential has expired, so each ask is answered
+        // with the next credential -- the same fallback the REST side makes on
+        // a 401. It can also ask more than once for one successful clone, so
+        // the last credential is repeated rather than refused: refusing would
+        // break the ordinary case of having only one. libgit2 caps its own
+        // replays, so repeating cannot loop.
+        let index = asked.min(credentials.all().len() - 1);
+        asked += 1;
+        Cred::userpass_plaintext(
+            "x-bitbucket-api-token-auth",
+            &credentials.all()[index].token,
+        )
     });
     callbacks
 }
 
-fn fetch_options(token: &str, shallow: bool) -> FetchOptions<'_> {
+fn fetch_options(credentials: &Credentials, shallow: bool) -> FetchOptions<'_> {
     let mut options = FetchOptions::new();
     if shallow {
         options.depth(1);
     }
-    options.remote_callbacks(callbacks(token));
+    options.remote_callbacks(callbacks(credentials));
     options
 }
 
@@ -175,7 +189,7 @@ fn clone_snapshot(
     config: &Config,
     repository: &Repository,
     branch: &str,
-    token: &str,
+    credentials: &Credentials,
     checkout: &Path,
 ) -> Result<Option<Sync>> {
     fs::create_dir_all(checkout.parent().context("invalid snapshot path")?)?;
@@ -183,7 +197,7 @@ fn clone_snapshot(
     builder.branch(branch);
     let shallow =
         repository.clone_url.starts_with("http://") || repository.clone_url.starts_with("https://");
-    builder.fetch_options(fetch_options(token, shallow));
+    builder.fetch_options(fetch_options(credentials, shallow));
     if let Err(error) = builder.clone(&repository.clone_url, checkout) {
         if checkout.exists() {
             config.validate_cache_target(checkout)?;
@@ -207,7 +221,7 @@ pub fn synchronize(
     config: &Config,
     repository: &Repository,
     branch: &str,
-    token: &str,
+    credentials: &Credentials,
     max_age: Option<Duration>,
 ) -> Result<Sync> {
     validate_branch(branch)?;
@@ -223,7 +237,8 @@ pub fn synchronize(
         return Ok(Sync::Ready(Box::new(reused)));
     }
     if !checkout.exists()
-        && let Some(unavailable) = clone_snapshot(config, repository, branch, token, &checkout)?
+        && let Some(unavailable) =
+            clone_snapshot(config, repository, branch, credentials, &checkout)?
     {
         return Ok(unavailable);
     }
@@ -244,7 +259,8 @@ pub fn synchronize(
                     checkout.display()
                 )
             })?;
-            if let Some(unavailable) = clone_snapshot(config, repository, branch, token, &checkout)?
+            if let Some(unavailable) =
+                clone_snapshot(config, repository, branch, credentials, &checkout)?
             {
                 return Ok(unavailable);
             }
@@ -257,7 +273,7 @@ pub fn synchronize(
         let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
         let shallow = repository.clone_url.starts_with("http://")
             || repository.clone_url.starts_with("https://");
-        let mut options = fetch_options(token, shallow);
+        let mut options = fetch_options(credentials, shallow);
         if let Err(error) = remote.fetch(&[&refspec], Some(&mut options), None) {
             if missing_reference(&error) {
                 return Ok(Sync::Unavailable(format!(
@@ -435,15 +451,27 @@ mod tests {
             clone_url: remote_path.to_string_lossy().into_owned(),
             web_url: "https://example.invalid/test/fixture".into(),
         };
-        let snapshot = synchronize(&config, &repository, "main", "unused", None)
-            .unwrap()
-            .snapshot();
+        let snapshot = synchronize(
+            &config,
+            &repository,
+            "main",
+            &Credentials::supplied("unused"),
+            None,
+        )
+        .unwrap()
+        .snapshot();
         assert_eq!(snapshot.commit, first.to_string());
         assert!(snapshot.checkout.join("source.rs").exists());
         let second = commit(&remote, "fn second() {}\n");
-        let updated = synchronize(&config, &repository, "main", "unused", None)
-            .unwrap()
-            .snapshot();
+        let updated = synchronize(
+            &config,
+            &repository,
+            "main",
+            &Credentials::supplied("unused"),
+            None,
+        )
+        .unwrap()
+        .snapshot();
         assert_eq!(updated.commit, second.to_string());
         assert_eq!(
             fs::read_to_string(updated.checkout.join("source.rs"))
@@ -483,7 +511,14 @@ mod tests {
             web_url: "https://example.invalid/test/empty".into(),
         };
         assert!(matches!(
-            synchronize(&config, &repository, "main", "unused", None).unwrap(),
+            synchronize(
+                &config,
+                &repository,
+                "main",
+                &Credentials::supplied("unused"),
+                None
+            )
+            .unwrap(),
             Sync::Unavailable(_)
         ));
 
@@ -491,11 +526,25 @@ mod tests {
         commit(&populated, "fn only_on_main() {}\n");
         populated.set_head("refs/heads/main").unwrap();
         assert!(matches!(
-            synchronize(&config, &repository, "main", "unused", None).unwrap(),
+            synchronize(
+                &config,
+                &repository,
+                "main",
+                &Credentials::supplied("unused"),
+                None
+            )
+            .unwrap(),
             Sync::Ready(_)
         ));
         assert!(matches!(
-            synchronize(&config, &repository, "release/2.x", "unused", None).unwrap(),
+            synchronize(
+                &config,
+                &repository,
+                "release/2.x",
+                &Credentials::supplied("unused"),
+                None
+            )
+            .unwrap(),
             Sync::Unavailable(_)
         ));
     }
@@ -527,9 +576,15 @@ mod tests {
             clone_url: remote_path.to_string_lossy().into_owned(),
             web_url: "https://example.invalid/test/described".into(),
         };
-        let snapshot = synchronize(&config, &repository, "main", "unused", None)
-            .unwrap()
-            .snapshot();
+        let snapshot = synchronize(
+            &config,
+            &repository,
+            "main",
+            &Credentials::supplied("unused"),
+            None,
+        )
+        .unwrap()
+        .snapshot();
         let meta = read_meta(&snapshot.checkout).expect("a snapshot describes itself");
         assert_eq!(meta.repository.full_name, "test/described");
         assert_eq!(meta.branch, "main");
@@ -544,7 +599,14 @@ mod tests {
 
         // and it moves with the snapshot
         let second = commit(&remote, "fn second() {}\n");
-        synchronize(&config, &repository, "main", "unused", None).unwrap();
+        synchronize(
+            &config,
+            &repository,
+            "main",
+            &Credentials::supplied("unused"),
+            None,
+        )
+        .unwrap();
         let meta = read_meta(&snapshot.checkout).unwrap();
         assert_eq!(meta.commit, second.to_string());
         assert!(meta.synced_at >= snapshot.synchronized_at);
@@ -575,7 +637,14 @@ mod tests {
             clone_url: remote_path.to_string_lossy().into_owned(),
             web_url: "https://example.invalid/test/windowed".into(),
         };
-        synchronize(&config, &repository, "main", "unused", None).unwrap();
+        synchronize(
+            &config,
+            &repository,
+            "main",
+            &Credentials::supplied("unused"),
+            None,
+        )
+        .unwrap();
         let second = commit(&remote, "fn second() {}\n");
 
         // inside the window: the old commit stands, and is not called stale,
@@ -584,7 +653,7 @@ mod tests {
             &config,
             &repository,
             "main",
-            "unused",
+            &Credentials::supplied("unused"),
             Some(Duration::from_secs(3600)),
         )
         .unwrap()
@@ -597,7 +666,7 @@ mod tests {
             &config,
             &repository,
             "main",
-            "unused",
+            &Credentials::supplied("unused"),
             Some(Duration::from_secs(0)),
         )
         .unwrap()
@@ -630,15 +699,27 @@ mod tests {
             clone_url: remote_path.to_string_lossy().into_owned(),
             web_url: "https://example.invalid/test/damaged".into(),
         };
-        let first = synchronize(&config, &repository, "main", "unused", None)
-            .unwrap()
-            .snapshot();
+        let first = synchronize(
+            &config,
+            &repository,
+            "main",
+            &Credentials::supplied("unused"),
+            None,
+        )
+        .unwrap()
+        .snapshot();
         assert!(first.checkout.join("source.rs").exists());
 
         fs::remove_dir_all(first.checkout.join(".git")).unwrap();
-        let healed = synchronize(&config, &repository, "main", "unused", None)
-            .unwrap()
-            .snapshot();
+        let healed = synchronize(
+            &config,
+            &repository,
+            "main",
+            &Credentials::supplied("unused"),
+            None,
+        )
+        .unwrap()
+        .snapshot();
         assert_eq!(healed.commit, first.commit);
         assert!(healed.checkout.join("source.rs").exists());
     }

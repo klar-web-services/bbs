@@ -130,7 +130,7 @@ async fn bootstrap(State(state): State<ServerState>) -> Json<Bootstrap> {
     Json(Bootstrap {
         csrf_token: state.csrf,
         version: env!("CARGO_PKG_VERSION"),
-        authenticated: crate::auth::token().is_ok(),
+        authenticated: crate::auth::credentials(false).is_ok(),
     })
 }
 

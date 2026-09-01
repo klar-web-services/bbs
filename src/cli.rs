@@ -54,6 +54,13 @@ pub struct Cli {
     #[arg(long)]
     pub offline: bool,
 
+    /// Authenticate with the BB_TOKEN environment variable in preference to
+    /// the credential saved by `bbs login`. Without this, BB_TOKEN is only a
+    /// fallback: for an account that has never logged in, and for one whose
+    /// saved credential Bitbucket has started rejecting.
+    #[arg(long, global = true)]
+    pub env_token: bool,
+
     /// Reuse any snapshot fetched within this window instead of fetching it
     /// again, e.g. `5m`, `1h30m`, `2d`. Default is to always fetch.
     #[arg(long, value_name = "DURATION", value_parser = crate::duration::parse_duration_secs)]

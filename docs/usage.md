@@ -316,10 +316,18 @@ bbs serve --no-open
 ```sh
 bbs login                       # prompts, no echo
 echo "$TOKEN" | bbs login --token-stdin
-BB_TOKEN=... bbs "query"        # environment wins over the stored token
+BB_TOKEN=... bbs "query"        # used only if there is no saved credential
+bbs --env-token "query"         # use BB_TOKEN even though one is saved
 ```
 
 Token scopes: `read:workspace:bitbucket`, `read:repository:bitbucket`.
+
+`bbs` prefers the credential saved by `bbs login`. `BB_TOKEN` is a fallback,
+not a rival: it is what an account that has never logged in searches with, and
+what a saved credential falls through to once Bitbucket answers 401 — so an
+expired token is a warning on stderr rather than a failed run. `--env-token`
+reverses the order for one run, and fails outright if `BB_TOKEN` is unset
+rather than quietly using the credential it was asked to bypass.
 
 ## Updating
 
@@ -376,7 +384,7 @@ Cache lives beside it: `~/.cache/better-bitbucket-search/` on Linux.
 
 | Variable | Effect |
 | --- | --- |
-| `BB_TOKEN` | Token, overrides the credential store |
+| `BB_TOKEN` | Token. A fallback behind the saved credential; `--env-token` puts it first |
 | `BBS_REPOSITORY` | Release repository for `bbs update` |
 | `BBS_VERSION`, `BBS_INSTALL_DIR` | Used by the install scripts |
 
