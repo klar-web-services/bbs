@@ -105,6 +105,10 @@ pub struct SkippedFiles {
     pub too_large: usize,
     pub binary: usize,
     pub not_utf8: usize,
+    /// The size limit the scan applied, so the summary can name the number the
+    /// user would have to raise. Zero when nothing was skipped for size.
+    #[serde(default)]
+    pub too_large_limit: u64,
 }
 
 impl SkippedFiles {
@@ -113,12 +117,21 @@ impl SkippedFiles {
     }
 
     /// Reasons that actually occurred, for a summary line that names them.
+    /// The size reason carries its threshold: "3 too large" leaves a user
+    /// guessing what large means and which knob would move it.
     pub fn reasons(&self) -> Vec<String> {
+        let over = match self.too_large_limit {
+            0 => String::new(),
+            limit => format!(
+                " (over {}; raise --max-file-size)",
+                crate::size::human_bytes(limit)
+            ),
+        };
         let mut reasons = Vec::new();
         for (count, label) in [
-            (self.too_large, "too large"),
-            (self.binary, "binary"),
-            (self.not_utf8, "not UTF-8"),
+            (self.too_large, format!("too large{over}")),
+            (self.binary, "binary".to_string()),
+            (self.not_utf8, "not UTF-8".to_string()),
         ] {
             if count > 0 {
                 reasons.push(format!("{count} {label}"));

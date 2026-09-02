@@ -4,6 +4,7 @@ use crate::{
     model::{
         ResultLine, SearchResponse, SearchResult, SkippedFiles, SkippedRepository, Truncation,
     },
+    size::human_bytes,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -361,22 +362,6 @@ pub fn warmup_summary(report: &WarmupReport) -> String {
     lines.join("\n")
 }
 
-/// Cache sizes are reported in bytes everywhere they are machine-read. On a
-/// terminal, "4.2 GiB" is the number a person can act on.
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    match unit {
-        0 => format!("{bytes} B"),
-        _ => format!("{value:.1} {}", UNITS[unit]),
-    }
-}
-
 /// A warmup runs for minutes, not the milliseconds a search reports.
 fn human_duration(ms: u128) -> String {
     // Under a second, "0.0s" reads as a broken clock rather than as a fast
@@ -570,6 +555,7 @@ mod tests {
             too_large: 2,
             binary: 1,
             not_utf8: 0,
+            too_large_limit: 4 * 1024 * 1024,
         };
         capped.cached = true;
         capped.skipped = vec![SkippedRepository {
@@ -579,7 +565,11 @@ mod tests {
         }];
         let line = summary_line(&capped);
         assert!(line.starts_with("2 of 412 results"), "{line}");
-        assert!(line.contains("3 skipped: 2 too large, 1 binary"), "{line}");
+        // the size skip names the threshold and the flag that moves it
+        assert!(
+            line.contains("3 skipped: 2 too large (over 4.0 MiB; raise --max-file-size), 1 binary"),
+            "{line}"
+        );
         assert!(line.contains("cache hit"), "{line}");
         assert!(line.contains("more results than --max-results"), "{line}");
         assert!(line.contains("1 repositories skipped"), "{line}");
@@ -633,11 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn sizes_and_durations_read_as_quantities_a_person_can_act_on() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(999), "999 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
+    fn durations_read_as_quantities_a_person_can_act_on() {
         assert_eq!(human_duration(16), "16 ms");
         assert_eq!(human_duration(999), "999 ms");
         assert_eq!(human_duration(1400), "1.4s");

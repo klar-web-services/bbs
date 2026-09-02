@@ -186,6 +186,7 @@ the search until the user says they have done it.
 | `operators must be uppercase` | Section 3, rule 2 |
 | `this query has nothing to find` | Section 3, rule 3 |
 | `warning: skipped …` on stderr | One repository could not contribute (no commits, no such branch, no cached snapshot). The rest of the search still ran — mention it if it covers something the user asked about |
+| `N too large (over 4.0 MiB; raise --max-file-size)` in the summary | Files were never opened, so the query could not match them. If the target could plausibly be a bundle, a generated client, or a lock file, re-run with `--max-file-size 32M` (or `none`) |
 | `stopped early: pattern too expensive` | PCRE2 abandoned the pattern in some files; results are incomplete. Simplify the regex |
 | 401 / rejected credential | The token expired. Tell the user to run `bbs login` again |
 

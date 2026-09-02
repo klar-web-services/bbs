@@ -96,6 +96,21 @@ finds `team/api-gateway`. Only a filter that both opens and closes with `/` is a
 When a filter is in play the listing ends with `N of M repositories`, so an over-narrow
 pattern reads as a narrow filter rather than an empty account.
 
+## File size
+
+A file larger than the limit is never opened, so no filter and no query reaches it. The
+default is 10 MiB, which minified bundles, generated clients, and lock files can still exceed.
+
+```sh
+bbs 'query' --max-file-size 32M    # 512k, 4M, 1.5G -- units are binary
+bbs 'query' --max-file-size none   # or `0`: no limit at all
+```
+
+`max_file_bytes` in `config.toml` moves it for good. Unlike the display options, the
+limit is part of the result-cache key: widening it rescans, because the earlier scan
+never opened those files. Files skipped for size are counted in the summary, which
+names the limit they exceeded.
+
 ## Output
 
 ```sh
@@ -190,7 +205,7 @@ bbs cache forget team/api     # drop one repository's snapshots, all branches
 - Only tracked UTF-8 text files are searched. Binary files, submodule contents, and Git
   LFS payloads are skipped. A file counts as binary if a NUL byte appears in its first
   8 KiB.
-- Files above `max_file_bytes` (default 4 MiB) are skipped.
+- Files above `max_file_bytes` (default 10 MiB) are skipped.
 - Every skipped file is counted by reason and reported in `skipped_files` and in the
   summary line, so a file the scan walked past is never silently absent.
 - At most 20,000 matches per term per file; beyond that the response is marked

@@ -12,6 +12,7 @@ pub mod paths;
 pub mod query;
 pub mod search;
 pub mod server;
+pub mod size;
 pub mod skill;
 pub mod update;
 pub mod update_check;

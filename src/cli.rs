@@ -78,6 +78,12 @@ pub struct Cli {
     #[arg(long)]
     pub max_results: Option<usize>,
 
+    /// Skip files larger than this, e.g. `512k`, `4M`, `1.5G`. `none` (or `0`)
+    /// searches every file whatever its size. Defaults to the configured
+    /// `max_file_bytes`, 10 MiB out of the box.
+    #[arg(long, value_name = "SIZE", value_parser = crate::size::parse_size)]
+    pub max_file_size: Option<u64>,
+
     #[arg(long, value_enum, default_value = "relevance")]
     pub sort: CliSort,
 
@@ -126,6 +132,7 @@ impl Cli {
             max_age_seconds: self.max_age,
             context: self.context,
             max_results: self.max_results,
+            max_file_bytes: self.max_file_size,
             sort: self.sort.into(),
             no_cache: self.no_cache,
         }
@@ -427,6 +434,23 @@ mod tests {
         assert!(Cli::try_parse_from(["bbs", "auto-update"]).is_err());
         assert!(Cli::try_parse_from(["bbs", "auto-update", "yes"]).is_err());
         assert!(Cli::try_parse_from(["bbs", "auto-update", "on", "off"]).is_err());
+    }
+
+    /// The size limit is the difference between finding a generated file and
+    /// silently walking past it, so it is a flag, in the units people use.
+    #[test]
+    fn max_file_size_takes_a_unit_and_reaches_the_request() {
+        let cli = Cli::try_parse_from(["bbs", "needle", "--max-file-size", "32M"]).unwrap();
+        assert_eq!(cli.search_request().max_file_bytes, Some(32 * 1024 * 1024));
+
+        let unlimited = Cli::try_parse_from(["bbs", "needle", "--max-file-size", "none"]).unwrap();
+        assert_eq!(unlimited.search_request().max_file_bytes, Some(u64::MAX));
+
+        // Absent, the configured limit decides -- not a default baked in here.
+        let plain = Cli::try_parse_from(["bbs", "needle"]).unwrap();
+        assert_eq!(plain.search_request().max_file_bytes, None);
+
+        assert!(Cli::try_parse_from(["bbs", "needle", "--max-file-size", "big"]).is_err());
     }
 
     #[test]

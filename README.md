@@ -151,6 +151,7 @@ Query rules:
 - `--path` accepts Git-style `*`, `?`, character classes, and recursive `**` globs. A pattern with no `/` matches at any depth; `./x` anchors it to the root.
 - `--exclude-path`, a leading `!` in `--path`, and `--no-vendor` remove paths; `NOT` only ever excluded on content.
 - `--sort`, `--max-results`, `--context`, `-l` and `--count` change only what is shown, so they never force a rescan.
+- Files larger than 10 MiB are skipped, and the summary says how many. `--max-file-size 32M` (or `none`) reaches them; `max_file_bytes` in `config.toml` moves the default.
 - Normal searches synchronize every selected snapshot before scanning. `--max-age 5m` reuses anything fetched recently; `--offline` explicitly uses the last cached commits.
 
 At most 20,000 matches per pattern per file are collected; beyond that the result is reported as truncated rather than failing.

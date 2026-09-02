@@ -226,6 +226,27 @@ warning: no file matched --path `src/`; 383102 files were considered
 
 `--no-vendor` excludes exactly the directories the relevance ranking already demotes.
 
+### File size
+
+A file larger than the limit is never opened, so no filter and no query can reach it. The limit is
+10 MiB out of the box, which a minified bundle, a generated client, or a lock file can still exceed:
+
+```sh
+bbs "query" --max-file-size 32M                  # 512k, 4M, 1.5G -- units are binary
+bbs "query" --max-file-size none                 # or `0`: search every file, whatever its size
+```
+
+Set `max_file_bytes` in `config.toml` to move it for good; `--max-file-size` overrides it for one
+search. Unlike the display options, the limit *is* part of the result-cache key: widening it is a
+real rescan, because the previous scan never looked at those files.
+
+Files skipped for size are counted and the summary names the limit they fell foul of:
+
+```console
+$ bbs "query"
+12 of 12 results across 40 repositories (81023 files, 3 skipped: 3 too large (over 10.0 MiB; raise --max-file-size), 420 ms)
+```
+
 ## Output
 
 ```sh
@@ -473,7 +494,7 @@ derived data, so a corrupt one reports how to rebuild it rather than being fatal
 ```toml
 default_port = 7337
 sync_concurrency = 6         # repositories fetched in parallel
-max_file_bytes = 4194304     # files larger than this are skipped
+max_file_bytes = "10M"       # files larger than this are skipped; "none" or 0 for no limit
 max_results = 500
 context_lines = 2
 cache_context_lines = 6      # context stored, so a narrower --context is a cache hit
@@ -482,6 +503,8 @@ snapshot_budget_gb = 20
 result_budget_mb = 1024
 auto_update = false          # install available updates when a command runs
 ```
+
+`max_file_bytes` takes a byte count (`10485760`) or a size with a unit (`"10M"`, `"512k"`, `"1.5G"`).
 
 `cache_context_lines` and `cache_max_results` set how wide each scan is stored. A request narrower
 than both is answered from the stored scan; a wider one rescans and stores at the larger size.
@@ -503,7 +526,7 @@ leave it alone; `bbs update` resets it.
 ## Limits
 
 - Only tracked UTF-8 text files are searched. Binary files, submodule contents, and Git LFS payloads are skipped. A file counts as binary if a NUL byte appears in its first 8 KiB.
-- Files above `max_file_bytes` are skipped.
+- Files above `max_file_bytes` are skipped. Raise it with `--max-file-size`, or remove the limit with `--max-file-size none`.
 - Every skipped file is counted by reason and reported in `skipped_files` and in the summary line, so a file the scan walked past is never silently absent.
 - At most 20,000 matches per term per file; beyond that the response is marked truncated. `truncation` says which of the three causes applied.
 - One branch per repository per search. No history search.

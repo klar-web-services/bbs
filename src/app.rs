@@ -67,6 +67,10 @@ pub struct SearchRequest {
     pub max_age_seconds: Option<u64>,
     pub context: Option<usize>,
     pub max_results: Option<usize>,
+    /// Skip files larger than this. `None` takes `max_file_bytes` from the
+    /// configuration, which is where a lasting preference belongs; the
+    /// per-search override is for the day a generated file has to be read.
+    pub max_file_bytes: Option<u64>,
     pub sort: SortMode,
     pub no_cache: bool,
 }
@@ -88,6 +92,7 @@ impl Default for SearchRequest {
             max_age_seconds: None,
             context: None,
             max_results: None,
+            max_file_bytes: None,
             sort: SortMode::Relevance,
             no_cache: false,
         }
@@ -444,7 +449,7 @@ impl BbsApp {
             paths: request.paths,
             exclude_paths: request.exclude_paths,
             no_vendor: request.no_vendor,
-            max_file_bytes: self.config.max_file_bytes,
+            max_file_bytes: request.max_file_bytes.unwrap_or(self.config.max_file_bytes),
         };
         let presentation = Presentation {
             sort: request.sort,

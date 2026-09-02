@@ -13,6 +13,11 @@ pub struct Config {
     pub default_port: u16,
     pub sync_concurrency: usize,
     pub search_threads: usize,
+    /// Files larger than this are not searched. May be written as a byte
+    /// count or as a size with a unit -- `"32M"` -- and `0` or `"none"`
+    /// searches every file whatever its size. `--max-file-size` overrides it
+    /// for a single search.
+    #[serde(deserialize_with = "crate::size::deserialize_size")]
     pub max_file_bytes: u64,
     pub max_results: usize,
     pub context_lines: usize,
@@ -48,7 +53,7 @@ impl Default for Config {
             search_threads: std::thread::available_parallelism()
                 .map(usize::from)
                 .unwrap_or(4),
-            max_file_bytes: 4 * 1024 * 1024,
+            max_file_bytes: 10 * 1024 * 1024,
             max_results: 500,
             context_lines: 2,
             cache_context_lines: 6,
@@ -145,6 +150,21 @@ mod tests {
     #[test]
     fn auto_update_is_off_unless_asked_for() {
         assert!(!Config::default().auto_update);
+    }
+
+    /// The one limit people actually reach for should not have to be spelled
+    /// in bytes, and the file must keep accepting the byte counts already
+    /// written in it.
+    #[test]
+    fn the_file_size_limit_may_be_written_either_way() {
+        let count: Config = toml::from_str("max_file_bytes = 8388608").unwrap();
+        assert_eq!(count.max_file_bytes, 8 * 1024 * 1024);
+        let phrase: Config = toml::from_str(r#"max_file_bytes = "32M""#).unwrap();
+        assert_eq!(phrase.max_file_bytes, 32 * 1024 * 1024);
+        let unlimited: Config = toml::from_str(r#"max_file_bytes = "none""#).unwrap();
+        assert_eq!(unlimited.max_file_bytes, u64::MAX);
+        assert!(toml::from_str::<Config>(r#"max_file_bytes = "wat""#).is_err());
+        assert_eq!(Config::default().max_file_bytes, 10 * 1024 * 1024);
     }
 
     /// Writing the preference must not rewrite the file wholesale: a user's

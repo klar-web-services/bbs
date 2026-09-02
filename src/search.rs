@@ -38,7 +38,7 @@ impl Default for ScanOptions {
             paths: vec![],
             exclude_paths: vec![],
             no_vendor: false,
-            max_file_bytes: 4 * 1024 * 1024,
+            max_file_bytes: 10 * 1024 * 1024,
         }
     }
 }
@@ -119,6 +119,9 @@ pub struct ScanOutcome {
 #[derive(Default)]
 struct ScanCounters {
     too_large: AtomicUsize,
+    /// Recorded, not just applied: the summary names the limit a file fell
+    /// foul of so the user can decide whether to raise it.
+    too_large_limit: u64,
     binary: AtomicUsize,
     not_utf8: AtomicUsize,
     /// Counted once per file, not once per atom.
@@ -136,6 +139,7 @@ impl ScanCounters {
             too_large: self.too_large.load(Ordering::Relaxed),
             binary: self.binary.load(Ordering::Relaxed),
             not_utf8: self.not_utf8.load(Ordering::Relaxed),
+            too_large_limit: self.too_large_limit,
         }
     }
 }
@@ -225,7 +229,15 @@ pub fn run(
     let started = Instant::now();
     let filter = PathFilter::new(&options.paths, &options.exclude_paths, options.no_vendor)?;
     let positive = query.positive_atoms();
-    let counters = ScanCounters::default();
+    let counters = ScanCounters {
+        // Unlimited is not a threshold anyone needs told about, and it is the
+        // one value that would print as a nonsense "16.0 EiB".
+        too_large_limit: match options.max_file_bytes {
+            u64::MAX => 0,
+            limit => limit,
+        },
+        ..ScanCounters::default()
+    };
     let (candidates, filter_counts) =
         collect_candidates(snapshots, &filter, options.max_file_bytes, &counters)?;
     let files_searched = candidates.len();
@@ -673,11 +685,57 @@ mod tests {
                 too_large: 1,
                 binary: 1,
                 not_utf8: 1,
+                too_large_limit: 1024,
             }
         );
         // the candidate count must exclude the oversized file it never opened
         assert_eq!(response.files_searched, 3);
         assert_eq!(response.total_results, 1);
+    }
+
+    /// The limit is the only thing standing between the scan and a file it
+    /// walked past, so raising it must be enough to reach that file again --
+    /// and the report must name the limit that was in force.
+    #[test]
+    fn raising_the_size_limit_reaches_the_file_it_skipped() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("huge.txt"), "needle ".repeat(4096)).unwrap();
+        let snapshot = snapshot_of(dir.path());
+        let query = CompiledQuery::parse(
+            &["needle".into()],
+            QueryOptions {
+                case_mode: CaseMode::Sensitive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let search = |max_file_bytes| {
+            shown(
+                &query,
+                std::slice::from_ref(&snapshot),
+                ScanOptions {
+                    max_file_bytes,
+                    ..Default::default()
+                },
+                Presentation::default(),
+            )
+        };
+
+        let narrow = search(1024);
+        assert!(narrow.results.is_empty());
+        assert_eq!(narrow.skipped_files.too_large, 1);
+        assert_eq!(narrow.skipped_files.too_large_limit, 1024);
+        assert!(
+            narrow.skipped_files.reasons()[0].contains("over 1.0 KiB"),
+            "{:?}",
+            narrow.skipped_files.reasons()
+        );
+
+        let wide = search(u64::MAX);
+        assert_eq!(wide.results.len(), 1);
+        assert_eq!(wide.skipped_files.too_large, 0);
+        // No limit applied, so none is quoted at the user.
+        assert_eq!(wide.skipped_files.too_large_limit, 0);
     }
 
     /// The three ways a search can stop short mean different things, and only
