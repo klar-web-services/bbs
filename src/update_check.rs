@@ -389,6 +389,61 @@ mod tests {
         );
     }
 
+    /// Clearing must restamp, not unlink: an unlinked file drops `last_checked`,
+    /// so the next command would immediately spend a GitHub request.
+    #[test]
+    fn clearing_leaves_a_stamped_empty_state() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+
+        save(
+            &config,
+            &UpdateState {
+                last_checked: Some(Utc::now()),
+                available: None,
+            },
+        );
+
+        assert!(state_path(&config).exists(), "the file must remain");
+        let state = load(&config);
+        assert!(state.available.is_none());
+        assert_eq!(
+            decide(&state, version("1.0.0"), Utc::now()),
+            Decision::Throttled,
+            "a cleared state must still throttle"
+        );
+    }
+
+    /// `update.json` sits at the cache root, beside `snapshots/` and `results/`.
+    /// The cache commands must not remove it: losing `last_checked` would make
+    /// the next command spend a GitHub request.
+    #[test]
+    fn the_cache_commands_leave_the_update_state_alone() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+        config.ensure_dirs().unwrap();
+        save(
+            &config,
+            &UpdateState {
+                last_checked: Some(Utc::now()),
+                available: None,
+            },
+        );
+
+        crate::cache::clear_results(&config).unwrap();
+        assert!(
+            state_path(&config).exists(),
+            "clear-results must not remove update.json"
+        );
+
+        crate::cache::prune_results(&config).unwrap();
+        crate::cache::prune_snapshots(&config).unwrap();
+        assert!(
+            state_path(&config).exists(),
+            "prune must not remove update.json"
+        );
+    }
+
     #[test]
     fn the_banner_names_both_versions_and_the_command() {
         let plain = banner(version("0.5.0"), version("0.6.0"), false);

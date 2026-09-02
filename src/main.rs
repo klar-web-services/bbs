@@ -119,7 +119,7 @@ async fn run() -> Result<u8> {
             server::serve(app, args.port.unwrap_or(config.default_port), !args.no_open).await?;
             Ok(0)
         }
-        Some(Command::Update(args)) => update_command(args.check).await,
+        Some(Command::Update(args)) => update_command(args.check, &config).await,
         Some(Command::AutoUpdate(args)) => {
             let enabled = matches!(args.state, AutoUpdateState::On);
             config.set_auto_update(enabled)?;
@@ -308,16 +308,35 @@ async fn auto_update(current: update::Version, latest: update::Version) -> Resul
     }
 }
 
-async fn update_command(check_only: bool) -> Result<u8> {
+async fn update_command(check_only: bool, config: &Config) -> Result<u8> {
     let http = update::client()?;
     let repository = update::repository();
     let current = update::Version::current()?;
     let latest = update::latest_version(&http, update::API_BASE, &repository).await?;
+
+    // Whatever happens below, this command has just asked GitHub, so the
+    // shared clock is restamped and any cached offer is re-evaluated.
+    let clear = |available: Option<update::Version>| {
+        update_check::save(
+            config,
+            &update_check::UpdateState {
+                last_checked: Some(chrono::Utc::now()),
+                available,
+            },
+        )
+    };
+
     if latest <= current {
+        // Also the repair path for an out-of-band upgrade: a cached offer for
+        // a version we are already running is dropped here.
+        clear(None);
         println!("bbs {current} is already the latest release.");
         return Ok(0);
     }
     if check_only {
+        // `--check` records what it found, so it and ordinary commands share
+        // one throttle rather than each keeping their own.
+        clear(Some(latest));
         println!("bbs {current} (latest {latest})");
         return Ok(1);
     }
@@ -326,6 +345,7 @@ async fn update_command(check_only: bool) -> Result<u8> {
     let archive = update::download(&http, update::DOWNLOAD_BASE, &repository, latest).await?;
     let binary = update::extract(&archive)?;
     update::replace(&target, &binary)?;
+    clear(None);
     println!("Updated bbs to {latest} at {}", target.display());
     Ok(0)
 }
