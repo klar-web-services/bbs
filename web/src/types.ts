@@ -1,4 +1,5 @@
 export interface Bootstrap { csrf_token: string; version: string; authenticated: boolean }
+export interface UpdateStatus { available: string | null; current: string }
 export interface Repository { uuid: string; workspace: string; slug: string; name: string; full_name: string; default_branch?: string; web_url: string }
 export interface Catalog { discovered_at: string; repositories: Repository[] }
 export interface MatchRange { start: number; end: number; atom: number }

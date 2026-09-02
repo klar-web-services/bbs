@@ -1,6 +1,6 @@
 import { Fragment, FormEvent, useEffect, useMemo, useState } from 'react'
 import HighlightedLine from './HighlightedLine'
-import type { Bootstrap, Catalog, SearchEvent, SearchResponse, SearchResult } from './types'
+import type { Bootstrap, Catalog, SearchEvent, SearchResponse, SearchResult, UpdateStatus } from './types'
 
 const SPINNER = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f']
 const SKELETON = [[46, 18, 92], [120, 40], [30, 74, 26, 58], [88, 34], [52, 110, 22], [64, 28, 46], [100, 36, 18]]
@@ -28,6 +28,8 @@ export default function App() {
   const [response, setResponse] = useState<SearchResponse>(emptyResponse)
   const [repoFilter, setRepoFilter] = useState('')
   const [activeJob, setActiveJob] = useState<string | null>(null)
+  const [update, setUpdate] = useState<UpdateStatus | null>(null)
+  const [updateDismissed, setUpdateDismissed] = useState(false)
 
   useEffect(() => {
     fetch('/api/v1/bootstrap').then(r => r.json()).then(async data => {
@@ -36,6 +38,16 @@ export default function App() {
       if (!response.ok) throw new Error((await response.json()).error)
       setCatalog(await response.json())
     }).catch(err => setError(String(err)))
+  }, [])
+
+  // Immediately, then every 300s. This is a loopback read of state the server
+  // already holds, so it stays cheap even while a banner is showing — it is
+  // the server's GitHub call that stops, not this one.
+  useEffect(() => {
+    const poll = () => fetch('/api/v1/update').then(r => r.json()).then(setUpdate).catch(() => undefined)
+    poll()
+    const timer = setInterval(poll, 300_000)
+    return () => clearInterval(timer)
   }, [])
 
   useEffect(() => {
@@ -81,6 +93,12 @@ export default function App() {
 
   return <div className="shell">
     <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true"><SearchMark /></span><h1>Better Bitbucket Search</h1></div><div className="version">local · v{bootstrap?.version || '…'}</div></header>
+    {update?.available && !updateDismissed && (
+      <div className="update-banner" role="status">
+        <span>bbs {update.current} → {update.available} is available — run <code>bbs update</code></span>
+        <button type="button" onClick={() => setUpdateDismissed(true)} aria-label="Dismiss update notice">×</button>
+      </div>
+    )}
     <main>
       <form onSubmit={submit} className="search-panel">
         <div className="query-row"><span className="prompt">›</span><input id="query" autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder={'foo AND (bar OR /baz\\d+/)'} aria-label="Search query"/><kbd>{SHORTCUT}</kbd><button type={running ? 'button' : 'submit'} onClick={running ? cancel : undefined} disabled={!running && !query.trim()}>{running ? 'Cancel' : 'Search'}</button></div>

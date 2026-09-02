@@ -851,3 +851,38 @@ main {
     animation: none;
   }
 }
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 38px;
+  border-bottom: 1px solid #3a3320;
+  background: #221d10;
+  color: #e8c874;
+  font-size: 13px;
+}
+
+.update-banner code {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #2f2716;
+  font-family: inherit;
+}
+
+.update-banner button {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+.update-banner button:hover {
+  opacity: 1;
+}
