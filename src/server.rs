@@ -40,6 +40,7 @@ struct ServerState {
     app: BbsApp,
     csrf: String,
     jobs: Arc<RwLock<HashMap<Uuid, SearchJob>>>,
+    update: Arc<RwLock<Option<crate::update::Version>>>,
 }
 
 #[derive(Clone)]
@@ -54,6 +55,13 @@ struct Bootstrap {
     csrf_token: String,
     version: &'static str,
     authenticated: bool,
+}
+
+#[derive(Serialize)]
+struct UpdateStatus {
+    /// Rendered as a string; `Version` has no serde derives by design.
+    available: Option<String>,
+    current: &'static str,
 }
 
 #[derive(Serialize)]
@@ -72,9 +80,28 @@ pub async fn serve(app: BbsApp, port: u16, open: bool) -> Result<()> {
         app,
         csrf: Uuid::new_v4().to_string(),
         jobs: Arc::new(RwLock::new(HashMap::new())),
+        update: Arc::new(RwLock::new(None)),
     };
+
+    // Check at once, then every 300s. `resolve` stops calling GitHub as soon
+    // as it has an answer, so this loop costs nothing after a find. The
+    // server only ever reports: it never installs.
+    let poll = state.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Some(version) = crate::update_check::resolve(&poll.app.config).await {
+                *poll.update.write().await = Some(version);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                u64::try_from(crate::update_check::CHECK_INTERVAL_SECS).unwrap_or(300),
+            ))
+            .await;
+        }
+    });
+
     let router = Router::new()
         .route("/api/v1/bootstrap", get(bootstrap))
+        .route("/api/v1/update", get(update_status))
         .route("/api/v1/repositories", get(repositories))
         .route("/api/v1/search", post(start_search))
         .route("/api/v1/search/{id}/events", get(search_events))
@@ -131,6 +158,17 @@ async fn bootstrap(State(state): State<ServerState>) -> Json<Bootstrap> {
         csrf_token: state.csrf,
         version: env!("CARGO_PKG_VERSION"),
         authenticated: crate::auth::credentials(false).is_ok(),
+    })
+}
+
+/// No CSRF token: this mutates nothing, same as `bootstrap` and
+/// `repositories`. `local_request_guard` is a layer over every route, so the
+/// loopback restriction applies here automatically.
+async fn update_status(State(state): State<ServerState>) -> Json<UpdateStatus> {
+    let available = *state.update.read().await;
+    Json(UpdateStatus {
+        available: available.map(|version| version.to_string()),
+        current: env!("CARGO_PKG_VERSION"),
     })
 }
 
