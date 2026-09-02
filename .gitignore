@@ -11,4 +11,5 @@
 *.tmp
 .DS_Store
 /local-docs/
+/docs/superpowers/
 /CLAUDE.md
