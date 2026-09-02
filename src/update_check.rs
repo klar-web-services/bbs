@@ -154,6 +154,19 @@ async fn resolve_against(config: &Config, api_base: &str, repository: &str) -> O
     }
 }
 
+/// Bold yellow, then a dim call to action. Yellow rather than red: an
+/// available update is advice, and red already means `error:` here.
+pub fn banner(current: Version, available: Version, color: bool) -> String {
+    if color {
+        format!(
+            "\x1b[1;33mupdate available: bbs {current} -> {available}\x1b[0m\n\
+             \x1b[2mrun `bbs update`\x1b[0m"
+        )
+    } else {
+        format!("update available: bbs {current} -> {available}\nrun `bbs update`")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +387,21 @@ mod tests {
             None,
             "the stale value must be gone"
         );
+    }
+
+    #[test]
+    fn the_banner_names_both_versions_and_the_command() {
+        let plain = banner(version("0.5.0"), version("0.6.0"), false);
+        assert!(plain.contains("0.5.0"), "{plain}");
+        assert!(plain.contains("0.6.0"), "{plain}");
+        assert!(plain.contains("bbs update"), "{plain}");
+        assert!(
+            !plain.contains('\u{1b}'),
+            "no escapes when uncoloured: {plain}"
+        );
+
+        let coloured = banner(version("0.5.0"), version("0.6.0"), true);
+        assert!(coloured.contains("\u{1b}[1;33m"), "bold yellow: {coloured}");
+        assert!(coloured.ends_with("\u{1b}[0m"), "must reset: {coloured}");
     }
 }

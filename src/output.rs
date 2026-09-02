@@ -139,6 +139,23 @@ fn should_color(choice: ColorChoice) -> bool {
     }
 }
 
+/// The stderr twin of [`should_color`].
+///
+/// A separate function, not a parameter on the existing one, because the
+/// banner goes to stderr while results go to stdout. Reusing the stdout
+/// version would decide the banner's colour from whether *stdout* is a
+/// terminal — wrong in exactly the `bbs … --format json > out.json` case,
+/// where stdout is a file and stderr is still the user's terminal.
+///
+/// Public because `main.rs` is a separate binary crate.
+pub fn should_color_stderr(choice: ColorChoice) -> bool {
+    match choice {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => io::stderr().is_terminal(),
+    }
+}
+
 fn render_terminal(response: &SearchResponse, color: bool, options: &RenderOptions) -> Result<()> {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     match options.mode {
@@ -581,6 +598,12 @@ mod tests {
             block.contains("total     8460 ms   2 matched, 2 shown"),
             "{block}"
         );
+    }
+
+    #[test]
+    fn stderr_colour_follows_the_explicit_choice() {
+        assert!(should_color_stderr(ColorChoice::Always));
+        assert!(!should_color_stderr(ColorChoice::Never));
     }
 
     #[test]
