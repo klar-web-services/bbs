@@ -84,7 +84,6 @@ already behind it. Nothing else to install, configure, or log in to.
   raw-regex, and offline controls
 - Live sync progress, then results streamed to the page
 - Syntax highlighting with every match marked in place, in context
-- The Boolean grammar reference sits right under the query box
 - Badges telling you how fresh each result is
 - Permalinks to the exact commit and line in Bitbucket
 - `⌘ K` / `Ctrl K` jumps back to the query box, and a running search can be cancelled
