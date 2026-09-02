@@ -167,6 +167,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Update bbs to the latest published release.
     Update(UpdateArgs),
+    /// Turn automatic updates on or off.
+    AutoUpdate(AutoUpdateArgs),
     /// Inspect or prune local filesystem caches.
     Cache {
         #[command(subcommand)]
@@ -227,6 +229,20 @@ pub struct UpdateArgs {
     /// Report whether an update is available without installing it.
     #[arg(long)]
     pub check: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AutoUpdateArgs {
+    /// `on` installs an available update when a command runs; `off` only
+    /// reports it.
+    #[arg(value_name = "STATE")]
+    pub state: AutoUpdateState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AutoUpdateState {
+    On,
+    Off,
 }
 
 #[derive(Debug, Args)]
@@ -297,6 +313,28 @@ mod tests {
         assert!(matches!(plain.command, Some(Command::Update(ref a)) if !a.check));
         let checking = Cli::try_parse_from(["bbs", "update", "--check"]).unwrap();
         assert!(matches!(checking.command, Some(Command::Update(ref a)) if a.check));
+    }
+
+    #[test]
+    fn parses_the_auto_update_command() {
+        let on = Cli::try_parse_from(["bbs", "auto-update", "on"]).unwrap();
+        assert!(matches!(
+            on.command,
+            Some(Command::AutoUpdate(ref a)) if a.state == AutoUpdateState::On
+        ));
+        let off = Cli::try_parse_from(["bbs", "auto-update", "off"]).unwrap();
+        assert!(matches!(
+            off.command,
+            Some(Command::AutoUpdate(ref a)) if a.state == AutoUpdateState::Off
+        ));
+    }
+
+    /// The argument is required, and only these two words are accepted.
+    #[test]
+    fn auto_update_rejects_a_missing_or_unknown_state() {
+        assert!(Cli::try_parse_from(["bbs", "auto-update"]).is_err());
+        assert!(Cli::try_parse_from(["bbs", "auto-update", "yes"]).is_err());
+        assert!(Cli::try_parse_from(["bbs", "auto-update", "on", "off"]).is_err());
     }
 
     #[test]

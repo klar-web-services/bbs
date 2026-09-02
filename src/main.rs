@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use better_bitbucket_search::{
     app::{BbsApp, Progress},
     auth, bitbucket, cache,
-    cli::{CacheCommand, Cli, Command, ListCommand},
+    cli::{AutoUpdateState, CacheCommand, Cli, Command, ListCommand},
     config::Config,
     model::{RepositoryCatalog, SearchEvent},
     output, server, update,
@@ -117,6 +117,15 @@ async fn run() -> Result<u8> {
             Ok(0)
         }
         Some(Command::Update(args)) => update_command(args.check).await,
+        Some(Command::AutoUpdate(args)) => {
+            let enabled = matches!(args.state, AutoUpdateState::On);
+            config.set_auto_update(enabled)?;
+            println!(
+                "Automatic updates are {}.",
+                if enabled { "on" } else { "off" }
+            );
+            Ok(0)
+        }
         Some(Command::Cache { command }) => {
             match command {
                 CacheCommand::Status { verbose } => {
