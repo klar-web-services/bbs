@@ -29,7 +29,10 @@ export default function App() {
   const [repoFilter, setRepoFilter] = useState('')
   const [activeJob, setActiveJob] = useState<string | null>(null)
   const [update, setUpdate] = useState<UpdateStatus | null>(null)
-  const [updateDismissed, setUpdateDismissed] = useState(false)
+  // Keyed on the version, not a boolean: dismissing 9.9.9 must not also
+  // silence 10.0.0, or a long-lived tab goes quiet forever and the 300s poll
+  // stops being worth anything.
+  const [dismissedUpdate, setDismissedUpdate] = useState<string | null>(null)
 
   useEffect(() => {
     fetch('/api/v1/bootstrap').then(r => r.json()).then(async data => {
@@ -93,10 +96,10 @@ export default function App() {
 
   return <div className="shell">
     <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true"><SearchMark /></span><h1>Better Bitbucket Search</h1></div><div className="version">local · v{bootstrap?.version || '…'}</div></header>
-    {update?.available && !updateDismissed && (
+    {update?.available && update.available !== dismissedUpdate && (
       <div className="update-banner" role="status">
         <span>bbs {update.current} → {update.available} is available — run <code>bbs update</code></span>
-        <button type="button" onClick={() => setUpdateDismissed(true)} aria-label="Dismiss update notice">×</button>
+        <button type="button" onClick={() => setDismissedUpdate(update.available)} aria-label="Dismiss update notice">×</button>
       </div>
     )}
     <main>
