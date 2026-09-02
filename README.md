@@ -30,6 +30,16 @@ This downloads the latest release for your platform, verifies its SHA-256 agains
 
 `bbs update --check` reports whether a newer release exists without installing it, exiting `0` when already current and `1` when an update is available, so it composes in a shell prompt or a cron job.
 
+Every command checks whether a newer release exists before it runs, and prints a short notice to standard error when one does — standard out stays exactly what `--format json` expects, so nothing downstream has to filter it out. That check is throttled to once every five minutes, with the result cached, so it stays well inside GitHub's anonymous rate limit and off the critical path of most commands. `bbs serve` runs the same check on the same five-minute schedule and shows a one-line, dismissible banner in the browser instead of a stderr notice.
+
+If you would rather not see the notice at all, let `bbs` install updates for you:
+
+```sh
+bbs auto-update on
+```
+
+With that on, a command that finds an update installs it and carries on running on the new version, so the notice turns into an upgrade instead of a nag. `bbs serve` is deliberately left out: it is the one command people leave running unattended, and having the binary underneath it swapped out would be a surprise.
+
 If the binary lives somewhere you cannot write, the command names that path and stops. It never escalates privileges and never installs a second copy elsewhere on your `PATH`.
 
 ## Authenticate

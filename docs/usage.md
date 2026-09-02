@@ -373,12 +373,17 @@ cache_context_lines = 6      # context stored, so a narrower --context is a cach
 cache_max_results = 2000     # results stored, so any --sort order is a cache hit
 snapshot_budget_gb = 20
 result_budget_mb = 1024
+auto_update = false          # install available updates when a command runs
 ```
 
 `cache_context_lines` and `cache_max_results` set how wide each scan is stored. A request narrower
 than both is answered from the stored scan; a wider one rescans and stores at the larger size.
 
 Cache lives beside it: `~/.cache/better-bitbucket-search/` on Linux.
+
+The result of the periodic release check is cached in `update.json` at the root of the cache
+directory, beside `snapshots/` and `results/`. `bbs cache prune` and `bbs cache clear-results`
+leave it alone; `bbs update` resets it.
 
 ## Environment variables
 
