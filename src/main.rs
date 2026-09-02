@@ -37,7 +37,7 @@ async fn run() -> Result<u8> {
     let cli = Cli::parse();
     let config = Config::load()?;
     let app = BbsApp::new(config.clone())?.preferring_env_token(cli.env_token);
-    if let Some(notice) = update_notice(&cli, &config).await? {
+    if let Some(notice) = update_notice(&cli, &config).await {
         eprintln!("{notice}");
     }
     match &cli.command {
@@ -228,16 +228,12 @@ fn should_auto_update(cli: &Cli, preference: bool) -> bool {
 /// Infallible by construction: a failed check, an unwritable cache, or a
 /// rate-limited GitHub all produce `None` and leave the command untouched.
 /// Exit codes are never affected by update state.
-async fn update_notice(cli: &Cli, config: &Config) -> Result<Option<String>> {
+async fn update_notice(cli: &Cli, config: &Config) -> Option<String> {
     if exempt_from_check(cli) {
-        return Ok(None);
+        return None;
     }
-    let Ok(current) = update::Version::current() else {
-        return Ok(None);
-    };
-    let Some(available) = update_check::resolve(config).await else {
-        return Ok(None);
-    };
+    let current = update::Version::current().ok()?;
+    let available = update_check::resolve(config).await?;
 
     if should_auto_update(cli, config.auto_update)
         && auto_update_allowed(std::env::var_os(REEXEC_GUARD))
@@ -263,11 +259,11 @@ async fn update_notice(cli: &Cli, config: &Config) -> Result<Option<String>> {
         }
     }
 
-    Ok(Some(update_check::banner(
+    Some(update_check::banner(
         current,
         available,
         output::should_color_stderr(cli.color),
-    )))
+    ))
 }
 
 /// Set in the environment of a re-exec'd child so it cannot update again.
