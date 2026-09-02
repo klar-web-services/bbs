@@ -20,10 +20,9 @@ PowerShell:
 irm https://tools.klar.ws/bbs/install.ps1 | iex
 ```
 
-One binary, no dependencies. Node, Rust, and Git are not required. The scripts install
-to a user-local directory and verify the release checksum before writing anything. Set
-`BBS_REPOSITORY`, `BBS_VERSION`, or `BBS_INSTALL_DIR` to override their defaults, or
-grab an archive straight from GitHub Releases.
+One binary, no dependencies. Node, Rust, and Git are not required. Prebuilt archives
+for every platform are on
+[GitHub Releases](https://github.com/klar-web-services/bbs/releases).
 
 ## Update
 
