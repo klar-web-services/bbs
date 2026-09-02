@@ -5,7 +5,7 @@ use better_bitbucket_search::{
     cli::{AutoUpdateState, CacheCommand, Cli, Command, ListCommand},
     config::Config,
     model::{RepositoryCatalog, SearchEvent},
-    output, server, update,
+    output, server, update, update_check,
 };
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -37,6 +37,9 @@ async fn run() -> Result<u8> {
     let cli = Cli::parse();
     let config = Config::load()?;
     let app = BbsApp::new(config.clone())?.preferring_env_token(cli.env_token);
+    if let Some(notice) = update_notice(&cli, &config).await {
+        eprintln!("{notice}");
+    }
     match &cli.command {
         Some(Command::Login(args)) => {
             eprintln!(
@@ -204,6 +207,43 @@ async fn run() -> Result<u8> {
     }
 }
 
+/// Commands that manage the update itself, and so must not be preceded by an
+/// update check.
+fn exempt_from_check(cli: &Cli) -> bool {
+    matches!(
+        cli.command,
+        Some(Command::Update(_)) | Some(Command::AutoUpdate(_))
+    )
+}
+
+/// `bbs serve` is excluded even when the preference is on. See AC5: the web
+/// client must not replace its own binary, because it is the one command
+/// people leave running unattended.
+// Task 8 wires this into the auto-update path; it is only exercised by the
+// tests until then.
+#[allow(dead_code)]
+fn should_auto_update(cli: &Cli, preference: bool) -> bool {
+    preference && !matches!(cli.command, Some(Command::Serve(_)))
+}
+
+/// Resolves update state and returns the banner to show, if any.
+///
+/// Infallible by construction: a failed check, an unwritable cache, or a
+/// rate-limited GitHub all produce `None` and leave the command untouched.
+/// Exit codes are never affected by update state.
+async fn update_notice(cli: &Cli, config: &Config) -> Option<String> {
+    if exempt_from_check(cli) {
+        return None;
+    }
+    let current = update::Version::current().ok()?;
+    let available = update_check::resolve(config).await?;
+    Some(update_check::banner(
+        current,
+        available,
+        output::should_color_stderr(cli.color),
+    ))
+}
+
 async fn update_command(check_only: bool) -> Result<u8> {
     let http = update::client()?;
     let repository = update::repository();
@@ -275,5 +315,43 @@ mod tests {
             spinner_message(&event).as_deref(),
             Some("Syncing repositories 2/5")
         );
+    }
+
+    #[test]
+    fn the_update_commands_are_exempt_from_the_check() {
+        // `update` reports version state itself. `auto-update` must be exempt
+        // for a sharper reason: `bbs auto-update off` with the setting on and
+        // an update pending would otherwise install it and re-exec *before*
+        // honouring the request to turn the feature off.
+        for argv in [
+            ["bbs", "update"].as_slice(),
+            ["bbs", "update", "--check"].as_slice(),
+            ["bbs", "auto-update", "off"].as_slice(),
+            ["bbs", "auto-update", "on"].as_slice(),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(exempt_from_check(&cli), "{argv:?} must be exempt");
+        }
+
+        for argv in [
+            ["bbs", "foo"].as_slice(),
+            ["bbs", "serve"].as_slice(),
+            ["bbs", "list", "repos"].as_slice(),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(!exempt_from_check(&cli), "{argv:?} must be checked");
+        }
+    }
+
+    #[test]
+    fn serve_is_never_auto_updated() {
+        // AC5 carves out the web client: it is what runs under systemd or
+        // nohup, where replacing the binary underneath is exactly the
+        // surprise to avoid.
+        let serve = Cli::try_parse_from(["bbs", "serve"]).unwrap();
+        assert!(!should_auto_update(&serve, true));
+        let search = Cli::try_parse_from(["bbs", "foo"]).unwrap();
+        assert!(should_auto_update(&search, true));
+        assert!(!should_auto_update(&search, false), "off means off");
     }
 }
