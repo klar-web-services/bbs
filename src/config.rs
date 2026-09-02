@@ -25,6 +25,9 @@ pub struct Config {
     pub cache_max_results: usize,
     pub snapshot_budget_gb: u64,
     pub result_budget_mb: u64,
+    /// Install an available update automatically when a command runs.
+    /// Opt-in: replacing a user's binary is not a thing to do by surprise.
+    pub auto_update: bool,
     #[serde(skip)]
     pub config_dir: PathBuf,
     #[serde(skip)]
@@ -52,6 +55,7 @@ impl Default for Config {
             cache_max_results: 2000,
             snapshot_budget_gb: 20,
             result_budget_mb: 1024,
+            auto_update: false,
             config_dir,
             cache_dir,
         }
@@ -94,6 +98,24 @@ impl Config {
         self.cache_dir.join("results")
     }
 
+    /// Writes just this key, leaving the rest of the file as the user wrote
+    /// it. Serializing the whole struct instead would bake every current
+    /// default into the file, freezing values the user never chose and
+    /// silently opting them out of future default changes.
+    pub fn set_auto_update(&self, enabled: bool) -> Result<()> {
+        let path = self.config_path();
+        let mut document: toml::Table = match fs::read_to_string(&path) {
+            Ok(text) => toml::from_str(&text)
+                .with_context(|| format!("invalid configuration in {}", path.display()))?,
+            Err(_) => toml::Table::new(),
+        };
+        document.insert("auto_update".into(), toml::Value::Boolean(enabled));
+        fs::create_dir_all(&self.config_dir)?;
+        fs::write(&path, toml::to_string_pretty(&document)?)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(())
+    }
+
     pub fn validate_cache_target(&self, path: &Path) -> Result<()> {
         let root = self
             .cache_dir
@@ -105,5 +127,69 @@ impl Config {
             "refusing to operate outside the bbs cache root"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn config_in(dir: &Path) -> Config {
+        Config {
+            config_dir: dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn auto_update_is_off_unless_asked_for() {
+        assert!(!Config::default().auto_update);
+    }
+
+    /// Writing the preference must not rewrite the file wholesale: a user's
+    /// existing keys survive, and defaults they never set are not frozen in.
+    #[test]
+    fn setting_the_preference_preserves_other_keys() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+        std::fs::write(config.config_path(), "default_port = 9000\n").unwrap();
+
+        config.set_auto_update(true).unwrap();
+
+        let text = std::fs::read_to_string(config.config_path()).unwrap();
+        assert!(text.contains("default_port = 9000"), "{text}");
+        assert!(text.contains("auto_update = true"), "{text}");
+        assert!(
+            !text.contains("snapshot_budget_gb"),
+            "defaults leaked: {text}"
+        );
+    }
+
+    #[test]
+    fn the_preference_round_trips_and_can_be_turned_off() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+
+        // Note: `assert!(x)`, not `assert_eq!(x, true)` —
+        // `clippy::bool_assert_comparison` is warn-by-default and this repo
+        // gates CI on `clippy -D warnings`.
+        config.set_auto_update(true).unwrap();
+        let text = std::fs::read_to_string(config.config_path()).unwrap();
+        assert!(toml::from_str::<Config>(&text).unwrap().auto_update);
+
+        config.set_auto_update(false).unwrap();
+        let text = std::fs::read_to_string(config.config_path()).unwrap();
+        assert!(!toml::from_str::<Config>(&text).unwrap().auto_update);
+    }
+
+    #[test]
+    fn the_preference_can_be_written_without_an_existing_file() {
+        let dir = tempdir().unwrap();
+        let config = config_in(&dir.path().join("nested"));
+
+        config.set_auto_update(true).unwrap();
+
+        assert!(config.config_path().exists());
     }
 }
