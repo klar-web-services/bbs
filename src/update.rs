@@ -90,6 +90,19 @@ pub fn client() -> Result<reqwest::Client> {
         .context("cannot build the update HTTP client")
 }
 
+/// A client for the *check*, with a short deadline.
+///
+/// This is deliberately separate from [`client`]: `download` fetches a
+/// multi-megabyte archive through that one, and must not inherit a 3s
+/// timeout.
+pub fn checking_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(concat!("bbs/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .context("cannot build the update check HTTP client")
+}
+
 pub fn expected_digest(checksums: &str, asset: &str) -> Result<String> {
     for line in checksums.lines() {
         let mut fields = line.split_whitespace();

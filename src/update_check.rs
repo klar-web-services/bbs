@@ -110,6 +110,50 @@ pub fn decide(state: &UpdateState, current: Version, now: DateTime<Utc>) -> Deci
     }
 }
 
+/// The whole policy in one place, so the CLI and the server poll cannot
+/// drift apart. Returns the version to tell the user about, if any.
+///
+/// Never returns an error: every failure mode — offline, DNS, a 403 from the
+/// rate limiter, malformed JSON, timeout — is reported as "no update known"
+/// and the caller carries on.
+pub async fn resolve(config: &Config) -> Option<Version> {
+    resolve_against(
+        config,
+        crate::update::API_BASE,
+        &crate::update::repository(),
+    )
+    .await
+}
+
+async fn resolve_against(config: &Config, api_base: &str, repository: &str) -> Option<Version> {
+    let current = Version::current().ok()?;
+    let mut state = load(config);
+    match decide(&state, current, Utc::now()) {
+        Decision::Cached(available) => Some(available),
+        Decision::Throttled => {
+            if is_stale(&state, current) {
+                state.available = None;
+                save(config, &state);
+            }
+            None
+        }
+        Decision::Check => {
+            let found = match crate::update::checking_client() {
+                Ok(http) => crate::update::latest_version(&http, api_base, repository)
+                    .await
+                    .ok(),
+                Err(_) => None,
+            };
+            // A failed lookup still stamps, so an offline machine does not
+            // retry on every single command.
+            state.last_checked = Some(Utc::now());
+            state.available = found.filter(|latest| *latest > current);
+            save(config, &state);
+            state.available
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +296,83 @@ mod tests {
             available: Some(version("1.0.0")),
         };
         assert_eq!(decide(&state, version("1.0.0"), now), Decision::Throttled);
+    }
+
+    /// A minimal stand-in for the GitHub releases API, matching the mirror
+    /// pattern already used in `update.rs`'s tests.
+    async fn release_api(tag: &'static str) -> String {
+        use axum::{Router, routing::get};
+        let body = format!("{{\"tag_name\":\"{tag}\"}}");
+        let router = Router::new().route(
+            "/repos/team/repo/releases/latest",
+            get(move || async move { body }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_newer_release_is_found_and_recorded() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+        let base = release_api("v9.9.9").await;
+
+        let found = resolve_against(&config, &base, "team/repo").await;
+
+        assert_eq!(found, Some(version("9.9.9")));
+        let state = load(&config);
+        assert_eq!(state.available, Some(version("9.9.9")));
+        assert!(state.last_checked.is_some(), "the check must be stamped");
+    }
+
+    #[tokio::test]
+    async fn an_older_release_records_a_negative_answer() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+        let base = release_api("v0.0.1").await;
+
+        assert_eq!(resolve_against(&config, &base, "team/repo").await, None);
+
+        let state = load(&config);
+        assert_eq!(state.available, None);
+        assert!(state.last_checked.is_some(), "a negative answer is stamped");
+    }
+
+    /// An unreachable or refusing GitHub must be silent, not fatal.
+    #[tokio::test]
+    async fn an_unreachable_github_yields_no_update_and_does_not_panic() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+
+        let found = resolve_against(&config, "http://127.0.0.1:1", "team/repo").await;
+
+        assert_eq!(found, None);
+    }
+
+    /// Rule 0 end to end: a stale cached value is rewritten, and the next check
+    /// is actually issued rather than being suppressed again.
+    #[tokio::test]
+    async fn a_stale_cached_version_is_repaired_on_disk() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+        let current = crate::update::Version::current().unwrap();
+        save(
+            &config,
+            &UpdateState {
+                last_checked: Some(Utc::now() - chrono::Duration::seconds(CHECK_INTERVAL_SECS + 1)),
+                available: Some(current),
+            },
+        );
+        let base = release_api("v0.0.1").await;
+
+        assert_eq!(resolve_against(&config, &base, "team/repo").await, None);
+
+        assert_eq!(
+            load(&config).available,
+            None,
+            "the stale value must be gone"
+        );
     }
 }
