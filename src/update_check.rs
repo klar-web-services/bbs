@@ -73,6 +73,43 @@ pub fn save(config: &Config, state: &UpdateState) {
     }
 }
 
+/// What the state file says should happen next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Rule 1: a known-newer release. Report it; make no network call.
+    Cached(Version),
+    /// Rule 2: asked recently enough. Make no network call, report nothing.
+    Throttled,
+    /// Ask GitHub.
+    Check,
+}
+
+/// True when the file holds an `available` that is not actually newer than
+/// what is running — the out-of-band-upgrade case. Callers use this to know
+/// the file needs rewriting even when no check is made.
+pub fn is_stale(state: &UpdateState, current: Version) -> bool {
+    state
+        .available
+        .is_some_and(|available| available <= current)
+}
+
+pub fn decide(state: &UpdateState, current: Version, now: DateTime<Utc>) -> Decision {
+    // Rule 1.
+    if let Some(available) = state.available.filter(|available| *available > current) {
+        return Decision::Cached(available);
+    }
+    // Rule 0 lands here: a cached value that is not newer is treated exactly
+    // as if it were absent, and then rule 2 applies as normal.
+    match state.last_checked {
+        Some(last)
+            if now.signed_duration_since(last) < chrono::Duration::seconds(CHECK_INTERVAL_SECS) =>
+        {
+            Decision::Throttled
+        }
+        _ => Decision::Check,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +178,79 @@ mod tests {
 
         std::fs::write(state_path(&config), b"{\"available\":\"not-a-version\"}").unwrap();
         assert!(load(&config).available.is_none(), "bad version string");
+    }
+
+    fn version(text: &str) -> crate::update::Version {
+        crate::update::Version::parse(text).unwrap()
+    }
+
+    #[test]
+    fn a_newer_cached_version_is_used_without_asking_github() {
+        let state = UpdateState {
+            last_checked: Some(Utc::now()),
+            available: Some(version("9.9.9")),
+        };
+        assert_eq!(
+            decide(&state, version("1.0.0"), Utc::now()),
+            Decision::Cached(version("9.9.9"))
+        );
+    }
+
+    #[test]
+    fn a_recent_negative_answer_is_reused() {
+        let now = Utc::now();
+        let state = UpdateState {
+            last_checked: Some(now - chrono::Duration::seconds(CHECK_INTERVAL_SECS - 1)),
+            available: None,
+        };
+        assert_eq!(decide(&state, version("1.0.0"), now), Decision::Throttled);
+    }
+
+    #[test]
+    fn a_stale_negative_answer_triggers_a_check() {
+        let now = Utc::now();
+        let state = UpdateState {
+            last_checked: Some(now - chrono::Duration::seconds(CHECK_INTERVAL_SECS + 1)),
+            available: None,
+        };
+        assert_eq!(decide(&state, version("1.0.0"), now), Decision::Check);
+        assert_eq!(
+            decide(&UpdateState::default(), version("1.0.0"), now),
+            Decision::Check,
+            "empty state must check"
+        );
+    }
+
+    /// Rule 0. Without this the feature has a permanent failure mode: a user who
+    /// upgrades with install.sh instead of `bbs update` leaves a cached
+    /// `available` naming the version they are now running. Rule 1 would then
+    /// refuse to ever call GitHub again, and every command would print
+    /// "0.6.0 -> 0.6.0" forever.
+    #[test]
+    fn a_cached_version_that_is_not_newer_is_discarded() {
+        let now = Utc::now();
+        for cached in ["1.0.0", "0.9.0"] {
+            let state = UpdateState {
+                last_checked: Some(now - chrono::Duration::seconds(CHECK_INTERVAL_SECS + 1)),
+                available: Some(version(cached)),
+            };
+            assert_eq!(
+                decide(&state, version("1.0.0"), now),
+                Decision::Check,
+                "cached {cached} against running 1.0.0 must not be offered"
+            );
+            assert!(is_stale(&state, version("1.0.0")));
+        }
+    }
+
+    /// A discarded value still respects the throttle rather than checking at once.
+    #[test]
+    fn a_discarded_cached_version_still_honours_the_throttle() {
+        let now = Utc::now();
+        let state = UpdateState {
+            last_checked: Some(now - chrono::Duration::seconds(10)),
+            available: Some(version("1.0.0")),
+        };
+        assert_eq!(decide(&state, version("1.0.0"), now), Decision::Throttled);
     }
 }
