@@ -37,7 +37,7 @@ async fn run() -> Result<u8> {
     let cli = Cli::parse();
     let config = Config::load()?;
     let app = BbsApp::new(config.clone())?.preferring_env_token(cli.env_token);
-    if let Some(notice) = update_notice(&cli, &config).await {
+    if let Some(notice) = update_notice(&cli, &config).await? {
         eprintln!("{notice}");
     }
     match &cli.command {
@@ -219,9 +219,6 @@ fn exempt_from_check(cli: &Cli) -> bool {
 /// `bbs serve` is excluded even when the preference is on. See AC5: the web
 /// client must not replace its own binary, because it is the one command
 /// people leave running unattended.
-// Task 8 wires this into the auto-update path; it is only exercised by the
-// tests until then.
-#[allow(dead_code)]
 fn should_auto_update(cli: &Cli, preference: bool) -> bool {
     preference && !matches!(cli.command, Some(Command::Serve(_)))
 }
@@ -231,17 +228,88 @@ fn should_auto_update(cli: &Cli, preference: bool) -> bool {
 /// Infallible by construction: a failed check, an unwritable cache, or a
 /// rate-limited GitHub all produce `None` and leave the command untouched.
 /// Exit codes are never affected by update state.
-async fn update_notice(cli: &Cli, config: &Config) -> Option<String> {
+async fn update_notice(cli: &Cli, config: &Config) -> Result<Option<String>> {
     if exempt_from_check(cli) {
-        return None;
+        return Ok(None);
     }
-    let current = update::Version::current().ok()?;
-    let available = update_check::resolve(config).await?;
-    Some(update_check::banner(
+    let Ok(current) = update::Version::current() else {
+        return Ok(None);
+    };
+    let Some(available) = update_check::resolve(config).await else {
+        return Ok(None);
+    };
+
+    if should_auto_update(cli, config.auto_update)
+        && auto_update_allowed(std::env::var_os(REEXEC_GUARD))
+    {
+        // Clear before handing over, so the new binary does not re-offer the
+        // version it has just become. This restamps rather than unlinking, so
+        // the child does not immediately spend a GitHub request.
+        update_check::save(
+            config,
+            &update_check::UpdateState {
+                last_checked: Some(chrono::Utc::now()),
+                available: None,
+            },
+        );
+        match auto_update(current, available).await {
+            // Windows only; Unix `exec` does not return on success.
+            Ok(code) => std::process::exit(i32::from(code)),
+            Err(error) => {
+                // A failed auto-update must not turn a working search into an
+                // error. Say so and fall through to the ordinary banner.
+                eprintln!("warning: automatic update failed: {error:#}");
+            }
+        }
+    }
+
+    Ok(Some(update_check::banner(
         current,
         available,
         output::should_color_stderr(cli.color),
-    ))
+    )))
+}
+
+/// Set in the environment of a re-exec'd child so it cannot update again.
+const REEXEC_GUARD: &str = "BBS_AUTO_UPDATED";
+
+fn auto_update_allowed(guard: Option<std::ffi::OsString>) -> bool {
+    guard.is_none()
+}
+
+/// Installs the update, then hands the command to the new binary.
+///
+/// On Unix this never returns on success: `exec` replaces the process image.
+/// On Windows the running executable cannot replace its own image, so the new
+/// binary is spawned and its exit code forwarded.
+async fn auto_update(current: update::Version, latest: update::Version) -> Result<u8> {
+    let target = std::env::current_exe().context("cannot locate the running bbs binary")?;
+    eprintln!("Updating bbs {current} -> {latest}");
+    let http = update::client()?;
+    let archive =
+        update::download(&http, update::DOWNLOAD_BASE, &update::repository(), latest).await?;
+    let binary = update::extract(&archive)?;
+    update::replace(&target, &binary)?;
+    eprintln!("Updated bbs to {latest}; continuing on the new version");
+
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut command = std::process::Command::new(&target);
+    command.args(&arguments).env(REEXEC_GUARD, "1");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Only returns on failure.
+        let error = command.exec();
+        Err(anyhow::Error::new(error).context("cannot restart bbs after updating"))
+    }
+    #[cfg(windows)]
+    {
+        let status = command
+            .status()
+            .context("cannot restart bbs after updating")?;
+        Ok(status.code().unwrap_or(2) as u8)
+    }
 }
 
 async fn update_command(check_only: bool) -> Result<u8> {
@@ -353,5 +421,13 @@ mod tests {
         let search = Cli::try_parse_from(["bbs", "foo"]).unwrap();
         assert!(should_auto_update(&search, true));
         assert!(!should_auto_update(&search, false), "off means off");
+    }
+
+    #[test]
+    fn the_guard_variable_stops_a_second_auto_update() {
+        // The child of a re-exec must never auto-update again: a new binary that
+        // still believed an update was pending would loop forever.
+        assert!(!auto_update_allowed(Some(std::ffi::OsString::from("1"))));
+        assert!(auto_update_allowed(None));
     }
 }
