@@ -236,8 +236,8 @@ fn should_auto_update(cli: &Cli, preference: bool) -> bool {
 
 /// Resolves update state and returns the banner to show, if any.
 ///
-/// Infallible by construction: a failed check, an unwritable cache, or a
-/// rate-limited GitHub all produce `None` and leave the command untouched.
+/// Infallible by construction: a failed check, an unwritable cache, or an
+/// unreachable release server all produce `None` and leave the command untouched.
 /// Exit codes are never affected by update state.
 async fn update_notice(cli: &Cli, config: &Config) -> Option<String> {
     if exempt_from_check(cli) {
@@ -251,7 +251,7 @@ async fn update_notice(cli: &Cli, config: &Config) -> Option<String> {
     {
         // Clear before handing over, so the new binary does not re-offer the
         // version it has just become. This restamps rather than unlinking, so
-        // the child does not immediately spend a GitHub request.
+        // the child does not immediately spend another request.
         update_check::save(
             config,
             &update_check::UpdateState {
@@ -293,8 +293,7 @@ async fn auto_update(current: update::Version, latest: update::Version) -> Resul
     let target = std::env::current_exe().context("cannot locate the running bbs binary")?;
     eprintln!("Updating bbs {current} -> {latest}");
     let http = update::client()?;
-    let archive =
-        update::download(&http, update::DOWNLOAD_BASE, &update::repository(), latest).await?;
+    let archive = update::download(&http, &update::releases(), latest).await?;
     let binary = update::extract(&archive)?;
     update::replace(&target, &binary)?;
     eprintln!("Updated bbs to {latest}; continuing on the new version");
@@ -477,12 +476,12 @@ fn choose<'a>(available: &[&'a skill::Harness]) -> Result<Vec<&'a skill::Harness
 
 async fn update_command(check_only: bool, config: &Config) -> Result<u8> {
     let http = update::client()?;
-    let repository = update::repository();
+    let releases = update::releases();
     let current = update::Version::current()?;
-    let latest = update::latest_version(&http, update::API_BASE, &repository).await?;
+    let latest = update::latest_version(&http, &releases).await?;
 
-    // Whatever happens below, this command has just asked GitHub, so the
-    // shared clock is restamped and any cached offer is re-evaluated.
+    // Whatever happens below, this command has just asked the release server,
+    // so the shared clock is restamped and any cached offer is re-evaluated.
     let clear = |available: Option<update::Version>| {
         update_check::save(
             config,
@@ -509,7 +508,7 @@ async fn update_command(check_only: bool, config: &Config) -> Result<u8> {
     }
     let target = std::env::current_exe().context("cannot locate the running bbs binary")?;
     eprintln!("Updating bbs {current} -> {latest}");
-    let archive = update::download(&http, update::DOWNLOAD_BASE, &repository, latest).await?;
+    let archive = update::download(&http, &releases, latest).await?;
     let binary = update::extract(&archive)?;
     update::replace(&target, &binary)?;
     clear(None);

@@ -1,18 +1,18 @@
-//! Policy for the automatic update check: when to ask GitHub, what to
-//! remember, and what to say. The mechanism — the release lookup, the
-//! download, the checksum, the in-place replace — lives in [`crate::update`].
+//! Policy for the automatic update check: when to ask the release server
+//! (tools.klar.ws), what to remember, and what to say. The mechanism — the
+//! release lookup, the download, the checksum, the in-place replace — lives in
+//! [`crate::update`].
 
 use crate::{config::Config, update::Version};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// How long a "nothing new" answer is reused before asking GitHub again.
+/// How long a "nothing new" answer is reused before asking again.
 ///
-/// The GitHub release endpoint is called unauthenticated, which is limited to
-/// 60 requests per hour per IP. Checking on literally every command would
-/// exhaust that during ordinary use and then fail on every command after. The
-/// same interval is used by the server poll, so both paths share one budget.
+/// Checking on literally every command would add a network round trip to each
+/// one and send the release server a request per command. The same interval is
+/// used by the server poll, so both paths share one budget.
 pub const CHECK_INTERVAL_SECS: i64 = 300;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +80,7 @@ pub enum Decision {
     Cached(Version),
     /// Rule 2: asked recently enough. Make no network call, report nothing.
     Throttled,
-    /// Ask GitHub.
+    /// Ask the release server.
     Check,
 }
 
@@ -113,19 +113,14 @@ pub fn decide(state: &UpdateState, current: Version, now: DateTime<Utc>) -> Deci
 /// The whole policy in one place, so the CLI and the server poll cannot
 /// drift apart. Returns the version to tell the user about, if any.
 ///
-/// Never returns an error: every failure mode — offline, DNS, a 403 from the
-/// rate limiter, malformed JSON, timeout — is reported as "no update known"
-/// and the caller carries on.
+/// Never returns an error: every failure mode — offline, DNS, a server error,
+/// an unparseable version, a retired tool, timeout — is reported as "no update
+/// known" and the caller carries on.
 pub async fn resolve(config: &Config) -> Option<Version> {
-    resolve_against(
-        config,
-        crate::update::API_BASE,
-        &crate::update::repository(),
-    )
-    .await
+    resolve_against(config, &crate::update::releases()).await
 }
 
-async fn resolve_against(config: &Config, api_base: &str, repository: &str) -> Option<Version> {
+async fn resolve_against(config: &Config, releases: &str) -> Option<Version> {
     let current = Version::current().ok()?;
     let mut state = load(config);
     match decide(&state, current, Utc::now()) {
@@ -139,9 +134,7 @@ async fn resolve_against(config: &Config, api_base: &str, repository: &str) -> O
         }
         Decision::Check => {
             let found = match crate::update::checking_client() {
-                Ok(http) => crate::update::latest_version(&http, api_base, repository)
-                    .await
-                    .ok(),
+                Ok(http) => crate::update::latest_version(&http, releases).await.ok(),
                 Err(_) => None,
             };
             // A failed lookup still stamps, so an offline machine does not
@@ -242,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_cached_version_is_used_without_asking_github() {
+    fn a_newer_cached_version_is_used_without_asking_the_release_server() {
         let state = UpdateState {
             last_checked: Some(Utc::now()),
             available: Some(version("9.9.9")),
@@ -281,7 +274,7 @@ mod tests {
     /// Rule 0. Without this the feature has a permanent failure mode: a user who
     /// upgrades with install.sh instead of `bbs update` leaves a cached
     /// `available` naming the version they are now running. Rule 1 would then
-    /// refuse to ever call GitHub again, and every command would print
+    /// refuse to ever ask the release server again, and every command would print
     /// "0.6.0 -> 0.6.0" forever.
     #[test]
     fn a_cached_version_that_is_not_newer_is_discarded() {
@@ -311,28 +304,24 @@ mod tests {
         assert_eq!(decide(&state, version("1.0.0"), now), Decision::Throttled);
     }
 
-    /// A minimal stand-in for the GitHub releases API, matching the mirror
-    /// pattern already used in `update.rs`'s tests.
-    async fn release_api(tag: &'static str) -> String {
+    /// A minimal stand-in for tools.klar.ws serving only `latest`, matching
+    /// the mirror pattern already used in `update.rs`'s tests.
+    async fn release_server(latest: &'static str) -> String {
         use axum::{Router, routing::get};
-        let body = format!("{{\"tag_name\":\"{tag}\"}}");
-        let router = Router::new().route(
-            "/repos/team/repo/releases/latest",
-            get(move || async move { body }),
-        );
+        let router = Router::new().route("/bbs/latest", get(move || async move { latest }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        format!("http://{address}")
+        format!("http://{address}/bbs")
     }
 
     #[tokio::test]
     async fn a_newer_release_is_found_and_recorded() {
         let dir = tempdir().unwrap();
         let config = config_in(dir.path());
-        let base = release_api("v9.9.9").await;
+        let base = release_server("9.9.9\n").await;
 
-        let found = resolve_against(&config, &base, "team/repo").await;
+        let found = resolve_against(&config, &base).await;
 
         assert_eq!(found, Some(version("9.9.9")));
         let state = load(&config);
@@ -344,22 +333,22 @@ mod tests {
     async fn an_older_release_records_a_negative_answer() {
         let dir = tempdir().unwrap();
         let config = config_in(dir.path());
-        let base = release_api("v0.0.1").await;
+        let base = release_server("0.0.1\n").await;
 
-        assert_eq!(resolve_against(&config, &base, "team/repo").await, None);
+        assert_eq!(resolve_against(&config, &base).await, None);
 
         let state = load(&config);
         assert_eq!(state.available, None);
         assert!(state.last_checked.is_some(), "a negative answer is stamped");
     }
 
-    /// An unreachable or refusing GitHub must be silent, not fatal.
+    /// An unreachable or refusing release server must be silent, not fatal.
     #[tokio::test]
-    async fn an_unreachable_github_yields_no_update_and_does_not_panic() {
+    async fn an_unreachable_release_server_yields_no_update_and_does_not_panic() {
         let dir = tempdir().unwrap();
         let config = config_in(dir.path());
 
-        let found = resolve_against(&config, "http://127.0.0.1:1", "team/repo").await;
+        let found = resolve_against(&config, "http://127.0.0.1:1/bbs").await;
 
         assert_eq!(found, None);
     }
@@ -378,9 +367,9 @@ mod tests {
                 available: Some(current),
             },
         );
-        let base = release_api("v0.0.1").await;
+        let base = release_server("0.0.1\n").await;
 
-        assert_eq!(resolve_against(&config, &base, "team/repo").await, None);
+        assert_eq!(resolve_against(&config, &base).await, None);
 
         assert_eq!(
             load(&config).available,
@@ -390,7 +379,7 @@ mod tests {
     }
 
     /// Clearing must restamp, not unlink: an unlinked file drops `last_checked`,
-    /// so the next command would immediately spend a GitHub request.
+    /// so the next command would immediately spend a request.
     #[test]
     fn clearing_leaves_a_stamped_empty_state() {
         let dir = tempdir().unwrap();
@@ -416,7 +405,7 @@ mod tests {
 
     /// `update.json` sits at the cache root, beside `snapshots/` and `results/`.
     /// The cache commands must not remove it: losing `last_checked` would make
-    /// the next command spend a GitHub request.
+    /// the next command spend a request.
     #[test]
     fn the_cache_commands_leave_the_update_state_alone() {
         let dir = tempdir().unwrap();

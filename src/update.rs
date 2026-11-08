@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
@@ -8,9 +7,9 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
-const DEFAULT_REPOSITORY: &str = "klar-web-services/bbs";
-pub const API_BASE: &str = "https://api.github.com";
-pub const DOWNLOAD_BASE: &str = "https://github.com";
+/// Where releases are published (klar-web-services/tools.klar.ws): `latest`
+/// holds the current version, `v<version>/` the archives and `checksums.txt`.
+const DEFAULT_RELEASES: &str = "https://tools.klar.ws/bbs";
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const ASSET: &str = "bbs-x86_64-unknown-linux-gnu.tar.gz";
@@ -75,12 +74,14 @@ impl fmt::Display for Version {
     }
 }
 
-pub fn repository() -> String {
-    std::env::var("BBS_REPOSITORY")
+/// The release location, overridable with `BBS_BASE_URL`, the same variable
+/// the install scripts read.
+pub fn releases() -> String {
+    std::env::var("BBS_BASE_URL")
         .ok()
-        .map(|value| value.trim().to_owned())
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_REPOSITORY.to_owned())
+        .unwrap_or_else(|| DEFAULT_RELEASES.to_owned())
 }
 
 pub fn client() -> Result<reqwest::Client> {
@@ -216,55 +217,48 @@ fn persist(temp: NamedTempFile, target: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct LatestRelease {
-    tag_name: String,
-}
-
-pub async fn latest_version(
-    http: &reqwest::Client,
-    api_base: &str,
-    repository: &str,
-) -> Result<Version> {
-    let url = format!(
-        "{}/repos/{repository}/releases/latest",
-        api_base.trim_end_matches('/')
-    );
+/// Reads `{releases}/latest`, the current stable version.
+///
+/// No `latest` means nothing is published. If the tool was retired, the
+/// `RETIRED` notice next to it says why, and that is passed on.
+pub async fn latest_version(http: &reqwest::Client, releases: &str) -> Result<Version> {
+    let releases = releases.trim_end_matches('/');
+    let url = format!("{releases}/latest");
     let response = http
         .get(&url)
         .send()
         .await
         .with_context(|| format!("cannot reach {url}"))?;
     let status = response.status();
-    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-    {
-        bail!(
-            "GitHub refused the release lookup ({status}); unauthenticated requests are limited to 60 per hour"
-        );
-    }
     if status == reqwest::StatusCode::NOT_FOUND {
-        bail!("{repository} has no published releases");
+        if let Some(notice) = retirement_notice(http, releases).await {
+            bail!("bbs is no longer distributed\n\n{notice}");
+        }
+        bail!("no release is published at {releases}");
     }
     if !status.is_success() {
-        bail!("GitHub returned {status} for {url}");
+        bail!("{url} returned {status}");
     }
-    let release: LatestRelease = response
-        .json()
+    let text = response
+        .text()
         .await
-        .context("GitHub returned malformed release JSON")?;
-    Version::parse(&release.tag_name)
+        .with_context(|| format!("cannot read {url}"))?;
+    Version::parse(&text)
 }
 
-pub async fn download(
-    http: &reqwest::Client,
-    download_base: &str,
-    repository: &str,
-    version: Version,
-) -> Result<Vec<u8>> {
-    let base = format!(
-        "{}/{repository}/releases/download/v{version}",
-        download_base.trim_end_matches('/')
-    );
+/// The tombstone tools.klar.ws keeps for a retired tool, if there is one.
+async fn retirement_notice(http: &reqwest::Client, releases: &str) -> Option<String> {
+    let response = http.get(format!("{releases}/RETIRED")).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let text = response.text().await.ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+pub async fn download(http: &reqwest::Client, releases: &str, version: Version) -> Result<Vec<u8>> {
+    let base = format!("{}/v{version}", releases.trim_end_matches('/'));
     let checksums = get(http, &format!("{base}/checksums.txt")).await?;
     let checksums = String::from_utf8(checksums).context("checksums.txt is not valid UTF-8")?;
     let archive = get(http, &format!("{base}/{ASSET}")).await?;
@@ -279,7 +273,7 @@ async fn get(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
         .await
         .with_context(|| format!("cannot reach {url}"))?;
     if !response.status().is_success() {
-        bail!("GitHub returned {} for {url}", response.status());
+        bail!("{url} returned {}", response.status());
     }
     Ok(response
         .bytes()
@@ -464,27 +458,40 @@ mod tests {
     }
 
     #[test]
-    fn repository_defaults_to_the_release_repository() {
-        assert_eq!(repository(), DEFAULT_REPOSITORY);
+    fn releases_default_to_tools_klar_ws() {
+        assert_eq!(releases(), DEFAULT_RELEASES);
     }
 
-    async fn release_mirror(version: &str, archive: Vec<u8>, digest_line: String) -> String {
+    /// Serves fixed bodies at fixed paths, standing in for tools.klar.ws, and
+    /// returns the release location (`http://127.0.0.1:<port>/bbs`).
+    async fn serve(routes: Vec<(String, Vec<u8>)>) -> String {
         use axum::{Router, routing::get};
-        let base = format!("/team/repo/releases/download/v{version}");
-        let archive_route = format!("{base}/{ASSET}");
-        let checksums_route = format!("{base}/checksums.txt");
-        let api_route = "/repos/team/repo/releases/latest";
-        let tag = format!("{{\"tag_name\":\"v{version}\"}}");
-        let router = Router::new()
-            .route(&archive_route, get(move || async move { archive }))
-            .route(&checksums_route, get(move || async move { digest_line }))
-            .route(api_route, get(move || async move { tag }));
+        let mut router = Router::new();
+        for (path, body) in routes {
+            router = router.route(&path, get(move || async move { body }));
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        format!("http://{address}")
+        format!("http://{address}/bbs")
+    }
+
+    /// The layout tools.klar.ws publishes: `latest`, then `v<version>/`.
+    async fn release_mirror(version: &str, archive: Vec<u8>, digest_line: String) -> String {
+        serve(vec![
+            (
+                "/bbs/latest".to_owned(),
+                format!("{version}\n").into_bytes(),
+            ),
+            (
+                format!("/bbs/v{version}/checksums.txt"),
+                digest_line.into_bytes(),
+            ),
+            (format!("/bbs/v{version}/{ASSET}"), archive),
+        ])
+        .await
     }
 
     #[tokio::test]
@@ -494,11 +501,11 @@ mod tests {
         let base = release_mirror("9.9.9", archive, digest_line).await;
         let http = client().unwrap();
 
-        let latest = latest_version(&http, &base, "team/repo").await.unwrap();
+        let latest = latest_version(&http, &base).await.unwrap();
         assert_eq!(latest, Version::parse("9.9.9").unwrap());
         assert!(latest > Version::current().unwrap());
 
-        let downloaded = download(&http, &base, "team/repo", latest).await.unwrap();
+        let downloaded = download(&http, &base, latest).await.unwrap();
         let binary = extract(&downloaded).unwrap();
 
         let dir = tempdir().unwrap();
@@ -516,13 +523,50 @@ mod tests {
         let base = release_mirror("9.9.9", archive, wrong_digest).await;
         let http = client().unwrap();
 
-        let error = download(&http, &base, "team/repo", Version::parse("9.9.9").unwrap())
+        let error = download(&http, &base, Version::parse("9.9.9").unwrap())
             .await
             .unwrap_err()
             .to_string();
 
         assert!(
             error.contains("checksum verification failed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A retired tool has no `latest`, only the `RETIRED` notice; `bbs update`
+    /// must show that notice rather than a bare 404.
+    #[tokio::test]
+    async fn a_retired_release_reports_the_retirement_notice() {
+        let notice = "Retired 2030-01-01T00:00:00Z\n\nUse newbbs instead: https://example.com\n";
+        let base = serve(vec![("/bbs/RETIRED".to_owned(), notice.into())]).await;
+
+        let error = latest_version(&client().unwrap(), &base)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("no longer distributed"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("Use newbbs instead: https://example.com"),
+            "the notice must be passed on: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_published_is_reported_as_such() {
+        let base = serve(Vec::new()).await;
+
+        let error = latest_version(&client().unwrap(), &base)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("no release is published"),
             "unexpected error: {error}"
         );
     }
