@@ -83,3 +83,15 @@ jobs:
           files: dist/*
           body_path: notes.md
           generate_release_notes: true
+      # Serves https://tools.klar.ws/bbs/: release files plus generated
+      # install.sh / install.ps1 (see klar-web-services/tools.klar.ws).
+      - name: Publish to tools.klar.ws
+        uses: klar-web-services/tools.klar.ws/publish@v1
+        with:
+          tool: bbs
+          version: ${{ github.ref_name }}
+          files: dist/*
+          description: "Better Bitbucket Search: fast, local-first code search for Bitbucket Cloud."
+          bucket: ${{ secrets.TOOLS_S3_BUCKET }}
+          access-key-id: ${{ secrets.TOOLS_S3_ACCESS_KEY }}
+          secret-access-key: ${{ secrets.TOOLS_S3_SECRET_KEY }}
