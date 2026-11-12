@@ -45,11 +45,13 @@ jobs:
         with:
           tool: cargo-auditable
       - name: shearbolt
+        if: runner.os != 'Windows'
         uses: klar-web-services/shearbolt@v1
         with:
           working-directory: web
       - run: cargo auditable build --release --target ${{ matrix.target }}
       - name: shearbolt
+        if: runner.os != 'Windows'
         uses: klar-web-services/shearbolt@v1
       - if: runner.os != 'Windows'
         run: tar -czf "${{ matrix.artifact }}" -C "target/${{ matrix.target }}/release" bbs
