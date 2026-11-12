@@ -158,6 +158,7 @@ pub fn extract(archive: &[u8]) -> Result<Vec<u8>> {
             .context("release archive is not readable")?;
         let matches = entry
             .name()
+            .context("release archive is not readable")?
             .rsplit(['/', '\\'])
             .next()
             .is_some_and(|name| name == BINARY);
